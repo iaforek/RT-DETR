@@ -102,6 +102,7 @@ class YoloTxtDataset(Dataset):
     def __getitem__(self, index: int) -> Tuple[Tensor, Dict[str, Tensor]]:
         image_path = self.image_paths[index]
         image = Image.open(image_path).convert("RGB")
+        original_width, original_height = image.size
         labels, boxes = self._read_labels(self._label_path(image_path))
 
         if self.augment:
@@ -122,6 +123,9 @@ class YoloTxtDataset(Dataset):
             "boxes": torch.from_numpy(boxes).float(),
             "image_id": torch.tensor(index, dtype=torch.long),
             "path": str(image_path),
+            "orig_size": torch.tensor(
+                [original_height, original_width], dtype=torch.long
+            ),
         }
         return image_tensor, target
 

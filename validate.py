@@ -66,6 +66,14 @@ VOC_CLASS_NAMES = [
 
 IOU_THRESHOLDS = np.round(np.arange(0.50, 0.96, 0.05), 2)
 
+# COCO-style object-size buckets, measured as bounding-box area in the
+# ORIGINAL image coordinates (pixels^2).
+COCO_SIZE_RANGES = {
+    "small": (0.0, float(32 ** 2)),
+    "medium": (float(32 ** 2), float(96 ** 2)),
+    "large": (float(96 ** 2), math.inf),
+}
+
 
 # -----------------------------------------------------------------------------
 # Checkpoint and model helpers
@@ -207,6 +215,33 @@ def empty_prediction_data() -> Dict[str, np.ndarray]:
     }
 
 
+def box_areas_in_original_pixels(
+    boxes: np.ndarray,
+    original_size: Tuple[int, int],
+) -> np.ndarray:
+    """Return bbox areas in original-image pixel coordinates.
+
+    boxes are normalized xyxy coordinates. original_size is (height, width).
+    """
+    boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
+    if boxes.size == 0:
+        return np.zeros((0,), dtype=np.float64)
+    original_height, original_width = original_size
+    widths = np.maximum(0.0, boxes[:, 2] - boxes[:, 0]) * original_width
+    heights = np.maximum(0.0, boxes[:, 3] - boxes[:, 1]) * original_height
+    return widths * heights
+
+
+def area_in_range(
+    areas: np.ndarray,
+    area_range: Tuple[float, float],
+) -> np.ndarray:
+    minimum_area, maximum_area = area_range
+    if math.isinf(maximum_area):
+        return areas >= minimum_area
+    return (areas >= minimum_area) & (areas < maximum_area)
+
+
 def match_class_predictions(
     prediction_data: Mapping[str, np.ndarray],
     ground_truth_by_image: Mapping[int, np.ndarray],
@@ -297,6 +332,149 @@ def match_class_predictions(
     }
 
 
+def match_class_predictions_by_size(
+    prediction_data: Mapping[str, np.ndarray],
+    ground_truth_by_image: Mapping[int, np.ndarray],
+    image_sizes_by_id: Mapping[int, Tuple[int, int]],
+    iou_threshold: float,
+    minimum_confidence: float,
+    area_range: Tuple[float, float],
+) -> Dict[str, Any]:
+    """Match one class while evaluating only one object-size bucket.
+
+    Ground-truth boxes outside the requested size range are treated as ignored.
+    A prediction that matches an ignored GT is ignored rather than counted as FP.
+    An unmatched prediction is counted as FP only when the prediction itself is
+    inside the requested size range.
+    """
+    gt_active_by_image: Dict[int, np.ndarray] = {}
+    matched_ground_truth: Dict[int, np.ndarray] = {}
+    total_ground_truth = 0
+
+    for image_id, gt_boxes in ground_truth_by_image.items():
+        original_size = image_sizes_by_id[image_id]
+        gt_areas = box_areas_in_original_pixels(gt_boxes, original_size)
+        active = area_in_range(gt_areas, area_range)
+        gt_active_by_image[image_id] = active
+        matched_ground_truth[image_id] = np.zeros(gt_boxes.shape[0], dtype=bool)
+        total_ground_truth += int(active.sum())
+
+    image_ids = np.asarray(prediction_data["image_ids"], dtype=np.int64)
+    scores = np.asarray(prediction_data["scores"], dtype=np.float64)
+    boxes = np.asarray(prediction_data["boxes"], dtype=np.float64).reshape(-1, 4)
+
+    keep = scores >= minimum_confidence
+    image_ids = image_ids[keep]
+    scores = scores[keep]
+    boxes = boxes[keep]
+
+    if scores.size:
+        order = np.argsort(-scores, kind="stable")
+        image_ids = image_ids[order]
+        scores = scores[order]
+        boxes = boxes[order]
+
+    true_positive = np.zeros(scores.shape[0], dtype=np.float64)
+    false_positive = np.zeros(scores.shape[0], dtype=np.float64)
+    ignored_prediction = np.zeros(scores.shape[0], dtype=bool)
+    matched_ious = np.zeros(scores.shape[0], dtype=np.float64)
+
+    for prediction_index, (image_id_value, box) in enumerate(zip(image_ids, boxes)):
+        image_id = int(image_id_value)
+        original_size = image_sizes_by_id[image_id]
+        prediction_area = box_areas_in_original_pixels(
+            box.reshape(1, 4), original_size
+        )[0]
+        prediction_in_range = bool(
+            area_in_range(np.asarray([prediction_area]), area_range)[0]
+        )
+
+        gt_boxes = ground_truth_by_image.get(image_id)
+        if gt_boxes is None or gt_boxes.shape[0] == 0:
+            if prediction_in_range:
+                false_positive[prediction_index] = 1.0
+            else:
+                ignored_prediction[prediction_index] = True
+            continue
+
+        gt_active = gt_active_by_image[image_id]
+        matched = matched_ground_truth[image_id]
+        ious = box_iou_one_to_many(box, gt_boxes)
+
+        # Prefer an unmatched GT that belongs to the requested size bucket.
+        active_available = gt_active & ~matched
+        if active_available.any():
+            active_ious = np.where(active_available, ious, -1.0)
+            best_active = int(np.argmax(active_ious))
+            best_active_iou = float(active_ious[best_active])
+            if best_active_iou >= iou_threshold:
+                true_positive[prediction_index] = 1.0
+                matched_ious[prediction_index] = best_active_iou
+                matched[best_active] = True
+                continue
+
+        # A prediction matching a GT outside this bucket is ignored, not FP.
+        ignored_available = (~gt_active) & ~matched
+        if ignored_available.any():
+            ignored_ious = np.where(ignored_available, ious, -1.0)
+            best_ignored = int(np.argmax(ignored_ious))
+            best_ignored_iou = float(ignored_ious[best_ignored])
+            if best_ignored_iou >= iou_threshold:
+                ignored_prediction[prediction_index] = True
+                matched[best_ignored] = True
+                continue
+
+        if prediction_in_range:
+            false_positive[prediction_index] = 1.0
+        else:
+            ignored_prediction[prediction_index] = True
+
+    considered = ~ignored_prediction
+    tp_eval = true_positive[considered]
+    fp_eval = false_positive[considered]
+
+    cumulative_tp = np.cumsum(tp_eval)
+    cumulative_fp = np.cumsum(fp_eval)
+    recall_curve = (
+        cumulative_tp / total_ground_truth
+        if total_ground_truth > 0
+        else np.zeros_like(cumulative_tp)
+    )
+    precision_curve = cumulative_tp / np.maximum(
+        cumulative_tp + cumulative_fp, 1e-12
+    )
+    ap = (
+        average_precision_101_point(recall_curve, precision_curve)
+        if total_ground_truth > 0
+        else math.nan
+    )
+
+    tp = int(true_positive.sum())
+    fp = int(false_positive.sum())
+    fn = max(total_ground_truth - tp, 0)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(total_ground_truth, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+    positive_ious = matched_ious[true_positive.astype(bool)]
+
+    return {
+        "ap": float(ap),
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "ground_truth": total_ground_truth,
+        "predictions": int(considered.sum()),
+        "ignored_predictions": int(ignored_prediction.sum()),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "matched_ious": positive_ious,
+        "mean_matched_iou": (
+            float(positive_ious.mean()) if positive_ious.size else math.nan
+        ),
+    }
+
+
 def safe_mean(values: Sequence[float]) -> float:
     finite = [value for value in values if math.isfinite(value)]
     return float(np.mean(finite)) if finite else math.nan
@@ -339,7 +517,12 @@ def collect_predictions(
     max_detections: int,
     amp_enabled: bool,
     log_interval: int,
-) -> Tuple[List[Dict[str, np.ndarray]], List[Dict[int, np.ndarray]], int]:
+) -> Tuple[
+    List[Dict[str, np.ndarray]],
+    List[Dict[int, np.ndarray]],
+    Dict[int, Tuple[int, int]],
+    int,
+]:
     prediction_chunks: List[Dict[str, List[np.ndarray]]] = [
         {"image_ids": [], "scores": [], "boxes": []}
         for _ in range(num_classes)
@@ -347,6 +530,7 @@ def collect_predictions(
     ground_truth_by_class: List[Dict[int, np.ndarray]] = [
         {} for _ in range(num_classes)
     ]
+    image_sizes_by_id: Dict[int, Tuple[int, int]] = {}
     model.eval()
     image_offset = 0
     total_images = 0
@@ -369,6 +553,21 @@ def collect_predictions(
 
         for local_index, target in enumerate(targets):
             global_image_id = image_offset + local_index
+
+            if "orig_size" in target:
+                original_height, original_width = (
+                    int(value) for value in target["orig_size"].tolist()
+                )
+            else:
+                # Backward-compatible fallback for datasets created before
+                # orig_size was added to YoloTxtDataset.
+                with Image.open(str(target["path"])) as source_image:
+                    original_width, original_height = source_image.size
+
+            image_sizes_by_id[global_image_id] = (
+                original_height, original_width
+            )
+
             target_labels = target["labels"].cpu().numpy().astype(np.int64)
             target_boxes = box_cxcywh_to_xyxy(target["boxes"]).cpu().numpy()
             for class_id in np.unique(target_labels):
@@ -422,6 +621,7 @@ def collect_predictions(
     return (
         concatenate_prediction_chunks(prediction_chunks),
         ground_truth_by_class,
+        image_sizes_by_id,
         total_images,
     )
 
@@ -537,6 +737,161 @@ def evaluate_metrics(
     }
 
 
+def evaluate_size_metrics(
+    predictions_by_class: Sequence[Mapping[str, np.ndarray]],
+    ground_truth_by_class: Sequence[Mapping[int, np.ndarray]],
+    image_sizes_by_id: Mapping[int, Tuple[int, int]],
+    class_names: Sequence[str],
+    fixed_confidence_threshold: float,
+    fixed_iou_threshold: float,
+    ap_confidence_threshold: float,
+) -> Dict[str, Any]:
+    summaries: Dict[str, Dict[str, Any]] = {}
+    per_class_rows: List[Dict[str, Any]] = []
+
+    print("\nCalculating size-stratified metrics...")
+
+    for size_name, area_range in COCO_SIZE_RANGES.items():
+        micro_tp = micro_fp = micro_fn = 0
+        matched_iou_chunks: List[np.ndarray] = []
+        bucket_rows: List[Dict[str, Any]] = []
+
+        for class_id, class_name in enumerate(class_names):
+            fixed = match_class_predictions_by_size(
+                predictions_by_class[class_id],
+                ground_truth_by_class[class_id],
+                image_sizes_by_id,
+                iou_threshold=fixed_iou_threshold,
+                minimum_confidence=fixed_confidence_threshold,
+                area_range=area_range,
+            )
+
+            ap_values = [
+                float(
+                    match_class_predictions_by_size(
+                        predictions_by_class[class_id],
+                        ground_truth_by_class[class_id],
+                        image_sizes_by_id,
+                        iou_threshold=float(iou_threshold),
+                        minimum_confidence=ap_confidence_threshold,
+                        area_range=area_range,
+                    )["ap"]
+                )
+                for iou_threshold in IOU_THRESHOLDS
+            ]
+
+            ap50 = ap_values[0]
+            ap50_95 = safe_mean(ap_values)
+            micro_tp += int(fixed["tp"])
+            micro_fp += int(fixed["fp"])
+            micro_fn += int(fixed["fn"])
+
+            if fixed["matched_ious"].size:
+                matched_iou_chunks.append(fixed["matched_ious"])
+
+            row = {
+                "size": size_name,
+                "class_id": class_id,
+                "class_name": class_name,
+                "ground_truth": int(fixed["ground_truth"]),
+                "predictions_at_conf": int(fixed["predictions"]),
+                "ignored_predictions_at_conf": int(
+                    fixed["ignored_predictions"]
+                ),
+                "tp": int(fixed["tp"]),
+                "fp": int(fixed["fp"]),
+                "fn": int(fixed["fn"]),
+                "precision": float(fixed["precision"]),
+                "recall": float(fixed["recall"]),
+                "f1": float(fixed["f1"]),
+                "mean_matched_iou": float(fixed["mean_matched_iou"]),
+                "ap50": float(ap50),
+                "ap50_95": float(ap50_95),
+                "ap_by_iou": {
+                    f"{threshold:.2f}": float(value)
+                    for threshold, value in zip(IOU_THRESHOLDS, ap_values)
+                },
+            }
+            bucket_rows.append(row)
+            per_class_rows.append(row)
+
+        included = [row for row in bucket_rows if row["ground_truth"] > 0]
+        precision_micro = micro_tp / max(micro_tp + micro_fp, 1)
+        recall_micro = micro_tp / max(micro_tp + micro_fn, 1)
+        f1_micro = 2.0 * precision_micro * recall_micro / max(
+            precision_micro + recall_micro, 1e-12
+        )
+        mean_iou = (
+            float(np.concatenate(matched_iou_chunks).mean())
+            if matched_iou_chunks
+            else math.nan
+        )
+
+        summaries[size_name] = {
+            "area_min_px2": float(area_range[0]),
+            "area_max_px2": (
+                None if math.isinf(area_range[1]) else float(area_range[1])
+            ),
+            "ground_truth": int(sum(row["ground_truth"] for row in bucket_rows)),
+            "fixed_threshold": {
+                "confidence": fixed_confidence_threshold,
+                "iou": fixed_iou_threshold,
+                "tp": micro_tp,
+                "fp": micro_fp,
+                "fn": micro_fn,
+                "precision_micro": float(precision_micro),
+                "recall_micro": float(recall_micro),
+                "f1_micro": float(f1_micro),
+                "precision_macro": safe_mean(
+                    [row["precision"] for row in included]
+                ),
+                "recall_macro": safe_mean(
+                    [row["recall"] for row in included]
+                ),
+                "f1_macro": safe_mean([row["f1"] for row in included]),
+                "mean_matched_iou": mean_iou,
+            },
+            "ap": {
+                "minimum_confidence": ap_confidence_threshold,
+                "map50": safe_mean([row["ap50"] for row in included]),
+                "map50_95": safe_mean([row["ap50_95"] for row in included]),
+                "classes_with_ground_truth": len(included),
+            },
+        }
+
+    return {
+        "summary": summaries,
+        "per_class": per_class_rows,
+    }
+
+
+def print_size_summary(size_results: Mapping[str, Any]) -> None:
+    print("\n" + "=" * 104)
+    print("OBJECT SIZE SUMMARY (COCO bbox-area thresholds in original image pixels)")
+    print("=" * 104)
+    print(
+        f"{'Size':<8} {'GT':>7} {'TP':>7} {'FP':>7} {'FN':>7} "
+        f"{'P':>9} {'R':>9} {'F1':>9} {'IoU':>9} {'mAP50':>9} {'mAP50-95':>11}"
+    )
+    print("-" * 104)
+
+    for size_name in ("small", "medium", "large"):
+        row = size_results["summary"][size_name]
+        fixed = row["fixed_threshold"]
+        ap = row["ap"]
+        print(
+            f"{size_name:<8} {row['ground_truth']:7d} "
+            f"{fixed['tp']:7d} {fixed['fp']:7d} {fixed['fn']:7d} "
+            f"{format_metric(fixed['precision_micro']):>9} "
+            f"{format_metric(fixed['recall_micro']):>9} "
+            f"{format_metric(fixed['f1_micro']):>9} "
+            f"{format_metric(fixed['mean_matched_iou']):>9} "
+            f"{format_metric(ap['map50']):>9} "
+            f"{format_metric(ap['map50_95']):>11}"
+        )
+    print("=" * 104)
+
+
 def print_summary(results: Mapping[str, Any]) -> None:
     fixed = results["summary"]["fixed_threshold"]
     ap = results["summary"]["ap"]
@@ -582,19 +937,22 @@ def save_results(
     results: Mapping[str, Any],
     output_dir: Path,
     run_metadata: Mapping[str, Any],
+    size_results: Mapping[str, Any] | None = None,
 ) -> Tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "metrics.json"
     csv_path = output_dir / "per_class_metrics.csv"
+    json_payload: Dict[str, Any] = {
+        "run": dict(run_metadata),
+        "summary": results["summary"],
+        "per_class": results["per_class"],
+    }
+    if size_results is not None:
+        json_payload["size_metrics"] = size_results
+
     json_path.write_text(
         json.dumps(
-            make_json_safe(
-                {
-                    "run": dict(run_metadata),
-                    "summary": results["summary"],
-                    "per_class": results["per_class"],
-                }
-            ),
+            make_json_safe(json_payload),
             indent=2,
             allow_nan=False,
         ),
@@ -622,6 +980,90 @@ def save_results(
             writer.writerow({field: row[field] for field in fieldnames})
     print(f"Saved JSON metrics : {json_path}")
     print(f"Saved class table  : {csv_path}")
+
+    if size_results is not None:
+        size_csv_path = output_dir / "size_metrics.csv"
+        size_fieldnames = [
+            "size",
+            "area_min_px2",
+            "area_max_px2",
+            "ground_truth",
+            "tp",
+            "fp",
+            "fn",
+            "precision_micro",
+            "recall_micro",
+            "f1_micro",
+            "precision_macro",
+            "recall_macro",
+            "f1_macro",
+            "mean_matched_iou",
+            "map50",
+            "map50_95",
+            "classes_with_ground_truth",
+        ]
+        with size_csv_path.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=size_fieldnames)
+            writer.writeheader()
+            for size_name in ("small", "medium", "large"):
+                summary = size_results["summary"][size_name]
+                fixed = summary["fixed_threshold"]
+                ap = summary["ap"]
+                writer.writerow(
+                    {
+                        "size": size_name,
+                        "area_min_px2": summary["area_min_px2"],
+                        "area_max_px2": summary["area_max_px2"],
+                        "ground_truth": summary["ground_truth"],
+                        "tp": fixed["tp"],
+                        "fp": fixed["fp"],
+                        "fn": fixed["fn"],
+                        "precision_micro": fixed["precision_micro"],
+                        "recall_micro": fixed["recall_micro"],
+                        "f1_micro": fixed["f1_micro"],
+                        "precision_macro": fixed["precision_macro"],
+                        "recall_macro": fixed["recall_macro"],
+                        "f1_macro": fixed["f1_macro"],
+                        "mean_matched_iou": fixed["mean_matched_iou"],
+                        "map50": ap["map50"],
+                        "map50_95": ap["map50_95"],
+                        "classes_with_ground_truth": ap[
+                            "classes_with_ground_truth"
+                        ],
+                    }
+                )
+
+        per_class_size_csv = output_dir / "per_class_size_metrics.csv"
+        per_class_size_fields = [
+            "size",
+            "class_id",
+            "class_name",
+            "ground_truth",
+            "predictions_at_conf",
+            "ignored_predictions_at_conf",
+            "tp",
+            "fp",
+            "fn",
+            "precision",
+            "recall",
+            "f1",
+            "mean_matched_iou",
+            "ap50",
+            "ap50_95",
+        ]
+        with per_class_size_csv.open(
+            "w", newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=per_class_size_fields)
+            writer.writeheader()
+            for row in size_results["per_class"]:
+                writer.writerow(
+                    {field: row[field] for field in per_class_size_fields}
+                )
+
+        print(f"Saved size table   : {size_csv_path}")
+        print(f"Saved class/size   : {per_class_size_csv}")
+
     return json_path, csv_path
 
 
@@ -817,7 +1259,7 @@ def validate_dataset(args: argparse.Namespace) -> None:
     print(f"AMP inference: {amp_enabled}")
 
     start = time.perf_counter()
-    predictions, ground_truth, image_count = collect_predictions(
+    predictions, ground_truth, image_sizes, image_count = collect_predictions(
         model,
         loader,
         device,
@@ -837,6 +1279,20 @@ def validate_dataset(args: argparse.Namespace) -> None:
         args.ap_conf_thres,
     )
     print_summary(results)
+
+    size_results = None
+    if args.size_metrics:
+        size_results = evaluate_size_metrics(
+            predictions,
+            ground_truth,
+            image_sizes,
+            class_names,
+            args.conf_thres,
+            args.match_iou,
+            args.ap_conf_thres,
+        )
+        print_size_summary(size_results)
+
     milliseconds_per_image = 1000.0 * inference_seconds / max(image_count, 1)
     save_results(
         results,
@@ -859,7 +1315,9 @@ def validate_dataset(args: argparse.Namespace) -> None:
             "milliseconds_per_image": milliseconds_per_image,
             "device": str(device),
             "amp": amp_enabled,
+            "size_metrics": bool(args.size_metrics),
         },
+        size_results=size_results,
     )
     print(
         f"Inference time      : {inference_seconds:.2f}s "
@@ -924,6 +1382,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--match-iou", type=float, default=0.50)
     parser.add_argument("--ap-conf-thres", type=float, default=0.001)
     parser.add_argument("--max-detections", type=int, default=300)
+    parser.add_argument(
+        "--size-metrics",
+        action="store_true",
+        help=(
+            "Report COCO-style small/medium/large bbox metrics using "
+            "original-image pixel areas"
+        ),
+    )
     parser.add_argument("--output-dir", default="runs/rtdetr_voc/validation")
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--limit", type=int, default=None)
