@@ -609,6 +609,7 @@ class ExperimentConfig:
     decoder_layers: int
     num_denoising: int
     seed: int
+    pretrained: str
 
 
 def save_checkpoint(
@@ -641,7 +642,6 @@ def save_checkpoint(
     )
     os.replace(temporary, path)
 
-
 def load_checkpoint(
     path: Path,
     model: RTDETR,
@@ -659,6 +659,71 @@ def load_checkpoint(
     return int(checkpoint["epoch"]) + 1, float(
         checkpoint.get("best_validation_loss", math.inf)
     )
+
+def load_pretrained_weights(
+    path: Path,
+    model: nn.Module,
+) -> None:
+    """Load compatible model tensors without restoring training state."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
+
+    checkpoint = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if isinstance(checkpoint, Mapping) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("Checkpoint does not contain a model state dictionary")
+
+    current_state = model.state_dict()
+    compatible_state: Dict[str, Tensor] = {}
+    skipped: Dict[str, str] = {}
+
+    for original_name, value in state_dict.items():
+        if not isinstance(value, Tensor):
+            continue
+
+        # Allows checkpoints saved through DistributedDataParallel.
+        name = str(original_name).removeprefix("module.")
+
+        if name not in current_state:
+            skipped[name] = "not present in target model"
+            continue
+
+        if current_state[name].shape != value.shape:
+            skipped[name] = (
+                f"{tuple(value.shape)} -> "
+                f"{tuple(current_state[name].shape)}"
+            )
+            continue
+
+        compatible_state[name] = value
+
+    result = model.load_state_dict(compatible_state, strict=False)
+
+    print(f"Pretrained checkpoint: {path}")
+    print(f"Compatible tensors loaded: {len(compatible_state)}")
+    print(f"Incompatible tensors skipped: {len(skipped)}")
+
+    if skipped:
+        print("Skipped tensors:")
+        for name, reason in skipped.items():
+            print(f"  {name}: {reason}")
+
+    if result.unexpected_keys:
+        print("Unexpected keys:")
+        for name in result.unexpected_keys:
+            print(f"  {name}")
+
+    print(f"New or reinitialised tensors: {len(result.missing_keys)}")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -718,7 +783,16 @@ def train(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         num_decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
-    ).to(device)
+    )
+
+    if args.pretrained:
+        load_pretrained_weights(
+            Path(args.pretrained),
+            model,
+        )
+
+    model = model.to(device)
+
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -764,6 +838,7 @@ def train(args: argparse.Namespace) -> None:
         decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
         seed=args.seed,
+        pretrained=args.pretrained,
     )
     with (output_dir / "config.json").open("w", encoding="utf-8") as file:
         json.dump(asdict(config), file, indent=2)
@@ -889,6 +964,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument(
+        "--pretrained", 
+        default="",
+        help=(
+            "Load compatible model weights for transfer learning. "
+            "The optimiser, scheduler, scaler and epoch are not restored."
+        ),
+    )
     args = parser.parse_args()
 
     if args.img_size % 32 != 0:
@@ -901,6 +984,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--hidden-dim must be divisible by 8")
     if args.decoder_layers <= 0 or args.num_denoising < 0:
         parser.error("--decoder-layers must be positive and --num-denoising non-negative")
+    if args.resume and args.pretrained:
+        parser.error("--resume and --pretrained cannot be used together")
     return args
 
 
