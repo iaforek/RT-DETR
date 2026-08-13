@@ -865,6 +865,206 @@ def evaluate_size_metrics(
     }
 
 
+WITHIN_CLASS_METRIC_FIELDS = (
+    ("precision", "P"),
+    ("recall", "R"),
+    ("f1", "F1"),
+    ("mean_matched_iou", "IoU"),
+    ("ap50", "AP50"),
+    ("ap50_95", "AP50-95"),
+)
+
+
+def exact_two_sided_sign_test(positive_count: int, negative_count: int) -> float:
+    """Exact two-sided sign-test p-value, excluding ties."""
+    trials = int(positive_count + negative_count)
+    if trials <= 0:
+        return math.nan
+    tail = min(int(positive_count), int(negative_count))
+    probability = sum(math.comb(trials, index) for index in range(tail + 1))
+    probability /= float(2 ** trials)
+    return min(1.0, 2.0 * probability)
+
+
+def evaluate_within_class_scale(
+    size_results: Mapping[str, Any],
+    minimum_ground_truth_per_bucket: int,
+) -> Dict[str, Any]:
+    """Compare the same semantic class across small, medium and large buckets.
+
+    A class is included only when every size bucket contains at least
+    ``minimum_ground_truth_per_bucket`` ground-truth instances. This avoids
+    interpreting very sparse class/size combinations as stable scale effects.
+    """
+    rows_by_class: Dict[int, Dict[str, Mapping[str, Any]]] = {}
+    for row in size_results["per_class"]:
+        class_id = int(row["class_id"])
+        rows_by_class.setdefault(class_id, {})[str(row["size"])] = row
+
+    per_class: List[Dict[str, Any]] = []
+    for class_id in sorted(rows_by_class):
+        buckets = rows_by_class[class_id]
+        if not all(size_name in buckets for size_name in ("small", "medium", "large")):
+            continue
+
+        small = buckets["small"]
+        medium = buckets["medium"]
+        large = buckets["large"]
+        ground_truth_counts = {
+            "small": int(small["ground_truth"]),
+            "medium": int(medium["ground_truth"]),
+            "large": int(large["ground_truth"]),
+        }
+        if min(ground_truth_counts.values()) < minimum_ground_truth_per_bucket:
+            continue
+
+        class_row: Dict[str, Any] = {
+            "class_id": class_id,
+            "class_name": str(small["class_name"]),
+            "gt_small": ground_truth_counts["small"],
+            "gt_medium": ground_truth_counts["medium"],
+            "gt_large": ground_truth_counts["large"],
+        }
+
+        for metric_name, _ in WITHIN_CLASS_METRIC_FIELDS:
+            small_value = float(small[metric_name])
+            medium_value = float(medium[metric_name])
+            large_value = float(large[metric_name])
+            class_row[f"{metric_name}_small"] = small_value
+            class_row[f"{metric_name}_medium"] = medium_value
+            class_row[f"{metric_name}_large"] = large_value
+
+            finite = all(
+                math.isfinite(value)
+                for value in (small_value, medium_value, large_value)
+            )
+            if finite:
+                class_row[f"{metric_name}_delta_medium_small"] = (
+                    medium_value - small_value
+                )
+                class_row[f"{metric_name}_delta_large_medium"] = (
+                    large_value - medium_value
+                )
+                class_row[f"{metric_name}_delta_large_small"] = (
+                    large_value - small_value
+                )
+                class_row[f"{metric_name}_monotonic"] = bool(
+                    small_value <= medium_value <= large_value
+                )
+            else:
+                class_row[f"{metric_name}_delta_medium_small"] = math.nan
+                class_row[f"{metric_name}_delta_large_medium"] = math.nan
+                class_row[f"{metric_name}_delta_large_small"] = math.nan
+                class_row[f"{metric_name}_monotonic"] = False
+
+        per_class.append(class_row)
+
+    summary_rows: List[Dict[str, Any]] = []
+    for metric_name, metric_label in WITHIN_CLASS_METRIC_FIELDS:
+        finite_rows = [
+            row
+            for row in per_class
+            if all(
+                math.isfinite(float(row[f"{metric_name}_{size_name}"]))
+                for size_name in ("small", "medium", "large")
+            )
+        ]
+        small_values = np.asarray(
+            [row[f"{metric_name}_small"] for row in finite_rows], dtype=np.float64
+        )
+        medium_values = np.asarray(
+            [row[f"{metric_name}_medium"] for row in finite_rows], dtype=np.float64
+        )
+        large_values = np.asarray(
+            [row[f"{metric_name}_large"] for row in finite_rows], dtype=np.float64
+        )
+
+        delta_medium_small = medium_values - small_values
+        delta_large_medium = large_values - medium_values
+        delta_large_small = large_values - small_values
+        positive_count = int((delta_large_small > 0.0).sum())
+        negative_count = int((delta_large_small < 0.0).sum())
+        tie_count = int((delta_large_small == 0.0).sum())
+        monotonic_count = int(
+            ((small_values <= medium_values) & (medium_values <= large_values)).sum()
+        )
+        n = int(len(finite_rows))
+
+        summary_rows.append(
+            {
+                "metric": metric_name,
+                "metric_label": metric_label,
+                "classes": n,
+                "small_mean": float(small_values.mean()) if n else math.nan,
+                "medium_mean": float(medium_values.mean()) if n else math.nan,
+                "large_mean": float(large_values.mean()) if n else math.nan,
+                "small_median": float(np.median(small_values)) if n else math.nan,
+                "medium_median": float(np.median(medium_values)) if n else math.nan,
+                "large_median": float(np.median(large_values)) if n else math.nan,
+                "mean_delta_medium_small": (
+                    float(delta_medium_small.mean()) if n else math.nan
+                ),
+                "mean_delta_large_medium": (
+                    float(delta_large_medium.mean()) if n else math.nan
+                ),
+                "mean_delta_large_small": (
+                    float(delta_large_small.mean()) if n else math.nan
+                ),
+                "median_delta_large_small": (
+                    float(np.median(delta_large_small)) if n else math.nan
+                ),
+                "large_better_count": positive_count,
+                "large_worse_count": negative_count,
+                "large_equal_count": tie_count,
+                "large_better_fraction": (
+                    positive_count / max(positive_count + negative_count, 1)
+                ),
+                "monotonic_count": monotonic_count,
+                "monotonic_fraction": monotonic_count / max(n, 1),
+                "sign_test_p_two_sided": exact_two_sided_sign_test(
+                    positive_count, negative_count
+                ),
+            }
+        )
+
+    return {
+        "minimum_ground_truth_per_bucket": int(minimum_ground_truth_per_bucket),
+        "eligible_classes": len(per_class),
+        "summary": summary_rows,
+        "per_class": per_class,
+    }
+
+
+def print_within_class_scale_summary(results: Mapping[str, Any]) -> None:
+    print("\n" + "=" * 118)
+    print(
+        "WITHIN-CLASS SCALE ANALYSIS "
+        f"(minimum GT per size bucket = {results['minimum_ground_truth_per_bucket']})"
+    )
+    print(
+        "Same semantic classes are paired across small, medium and large object sizes."
+    )
+    print("=" * 118)
+    print(
+        f"{'Metric':<10} {'N':>4} {'Small':>9} {'Medium':>9} {'Large':>9} "
+        f"{'Delta L-S':>11} {'L>S':>9} {'Monotonic':>11} {'Sign p':>10}"
+    )
+    print("-" * 118)
+    for row in results["summary"]:
+        print(
+            f"{row['metric_label']:<10} {row['classes']:4d} "
+            f"{format_metric(row['small_mean']):>9} "
+            f"{format_metric(row['medium_mean']):>9} "
+            f"{format_metric(row['large_mean']):>9} "
+            f"{format_metric(row['mean_delta_large_small']):>11} "
+            f"{row['large_better_count']:3d}/{row['classes']:<4d} "
+            f"{row['monotonic_count']:3d}/{row['classes']:<6d} "
+            f"{format_metric(row['sign_test_p_two_sided']):>10}"
+        )
+    print("=" * 118)
+    print(f"Eligible classes: {results['eligible_classes']}")
+
+
 def print_size_summary(size_results: Mapping[str, Any]) -> None:
     print("\n" + "=" * 104)
     print("OBJECT SIZE SUMMARY (COCO bbox-area thresholds in original image pixels)")
@@ -1063,6 +1263,76 @@ def save_results(
 
         print(f"Saved size table   : {size_csv_path}")
         print(f"Saved class/size   : {per_class_size_csv}")
+
+        within_class = size_results.get("within_class_analysis")
+        if within_class is not None:
+            within_summary_csv = output_dir / "within_class_scale_summary.csv"
+            within_summary_fields = [
+                "metric",
+                "metric_label",
+                "classes",
+                "small_mean",
+                "medium_mean",
+                "large_mean",
+                "small_median",
+                "medium_median",
+                "large_median",
+                "mean_delta_medium_small",
+                "mean_delta_large_medium",
+                "mean_delta_large_small",
+                "median_delta_large_small",
+                "large_better_count",
+                "large_worse_count",
+                "large_equal_count",
+                "large_better_fraction",
+                "monotonic_count",
+                "monotonic_fraction",
+                "sign_test_p_two_sided",
+            ]
+            with within_summary_csv.open(
+                "w", newline="", encoding="utf-8"
+            ) as file:
+                writer = csv.DictWriter(file, fieldnames=within_summary_fields)
+                writer.writeheader()
+                for row in within_class["summary"]:
+                    writer.writerow(
+                        {field: row[field] for field in within_summary_fields}
+                    )
+
+            within_class_csv = output_dir / "within_class_scale_metrics.csv"
+            base_fields = [
+                "class_id",
+                "class_name",
+                "gt_small",
+                "gt_medium",
+                "gt_large",
+            ]
+            metric_fields: List[str] = []
+            for metric_name, _ in WITHIN_CLASS_METRIC_FIELDS:
+                metric_fields.extend(
+                    [
+                        f"{metric_name}_small",
+                        f"{metric_name}_medium",
+                        f"{metric_name}_large",
+                        f"{metric_name}_delta_medium_small",
+                        f"{metric_name}_delta_large_medium",
+                        f"{metric_name}_delta_large_small",
+                        f"{metric_name}_monotonic",
+                    ]
+                )
+            within_class_fields = base_fields + metric_fields
+            with within_class_csv.open(
+                "w", newline="", encoding="utf-8"
+            ) as file:
+                writer = csv.DictWriter(file, fieldnames=within_class_fields)
+                writer.writeheader()
+                for row in within_class["per_class"]:
+                    writer.writerow(
+                        {field: row[field] for field in within_class_fields}
+                    )
+
+            print(f"Saved within summary: {within_summary_csv}")
+            print(f"Saved within classes: {within_class_csv}")
 
     return json_path, csv_path
 
@@ -1293,6 +1563,14 @@ def validate_dataset(args: argparse.Namespace) -> None:
         )
         print_size_summary(size_results)
 
+        if args.within_class_analysis:
+            within_class_results = evaluate_within_class_scale(
+                size_results,
+                args.within_class_min_gt,
+            )
+            size_results["within_class_analysis"] = within_class_results
+            print_within_class_scale_summary(within_class_results)
+
     milliseconds_per_image = 1000.0 * inference_seconds / max(image_count, 1)
     save_results(
         results,
@@ -1316,6 +1594,8 @@ def validate_dataset(args: argparse.Namespace) -> None:
             "device": str(device),
             "amp": amp_enabled,
             "size_metrics": bool(args.size_metrics),
+            "within_class_analysis": bool(args.within_class_analysis),
+            "within_class_min_gt": int(args.within_class_min_gt),
         },
         size_results=size_results,
     )
@@ -1390,6 +1670,23 @@ def parse_args() -> argparse.Namespace:
             "original-image pixel areas"
         ),
     )
+    parser.add_argument(
+        "--within-class-analysis",
+        action="store_true",
+        help=(
+            "Compare the same classes across small/medium/large buckets and "
+            "save paired scale-effect metrics; requires --size-metrics"
+        ),
+    )
+    parser.add_argument(
+        "--within-class-min-gt",
+        type=int,
+        default=20,
+        help=(
+            "Minimum ground-truth instances required in EACH size bucket for "
+            "a class to enter within-class analysis (default: 20)"
+        ),
+    )
     parser.add_argument("--output-dir", default="runs/rtdetr_voc/validation")
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--limit", type=int, default=None)
@@ -1410,6 +1707,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--batch-size must be positive and --workers cannot be negative")
     if args.max_detections <= 0:
         parser.error("--max-detections must be positive")
+    if args.within_class_min_gt <= 0:
+        parser.error("--within-class-min-gt must be positive")
+    if args.within_class_analysis and not args.size_metrics:
+        parser.error("--within-class-analysis requires --size-metrics")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     return args
