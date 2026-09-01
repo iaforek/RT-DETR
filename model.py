@@ -203,12 +203,15 @@ class ResidualStage(nn.Module):
 class PResNet18(nn.Module):
     """Paddle-style ResNet-18 variant d used by official RT-DETR-R18.
 
-    Outputs the stride-8, stride-16 and stride-32 feature maps with channels
-    128, 256 and 512. No pretrained weights are loaded.
+    By default the backbone exposes the standard RT-DETR stride-8, stride-16
+    and stride-32 feature maps. ``use_p2=True`` additionally exposes the
+    stride-4 stage (P2) so fine spatial detail can participate in cross-scale
+    fusion and decoder attention. No pretrained weights are loaded.
     """
 
-    def __init__(self, input_channels: int = 3) -> None:
+    def __init__(self, input_channels: int = 3, use_p2: bool = False) -> None:
         super().__init__()
+        self.use_p2 = use_p2
         self.conv1 = nn.Sequential(
             OrderedDict(
                 [
@@ -229,8 +232,14 @@ class PResNet18(nn.Module):
                 ResidualStage(256, 512, 2, 5),
             ]
         )
-        self.out_channels = (128, 256, 512)
-        self.out_strides = (8, 16, 32)
+        if use_p2:
+            self.return_stage_indices = (0, 1, 2, 3)
+            self.out_channels = (64, 128, 256, 512)
+            self.out_strides = (4, 8, 16, 32)
+        else:
+            self.return_stage_indices = (1, 2, 3)
+            self.out_channels = (128, 256, 512)
+            self.out_strides = (8, 16, 32)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -241,15 +250,15 @@ class PResNet18(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor) -> Tuple[Tensor, ...]:
         x = self.conv1(x)
         x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
         outputs: List[Tensor] = []
         for stage_index, stage in enumerate(self.stages):
             x = stage(x)
-            if stage_index in (1, 2, 3):
+            if stage_index in self.return_stage_indices:
                 outputs.append(x)
-        return outputs[0], outputs[1], outputs[2]
+        return tuple(outputs)
 
 
 # -----------------------------------------------------------------------------
@@ -349,8 +358,12 @@ class HybridEncoder(nn.Module):
         super().__init__()
         self.in_channels = tuple(in_channels)
         self.feat_strides = tuple(feat_strides)
+        if len(self.in_channels) != len(self.feat_strides):
+            raise ValueError("in_channels and feat_strides must have the same length")
+        if len(self.in_channels) < 2:
+            raise ValueError("HybridEncoder requires at least two feature levels")
         self.hidden_dim = hidden_dim
-        self.out_channels = (hidden_dim, hidden_dim, hidden_dim)
+        self.out_channels = tuple(hidden_dim for _ in self.in_channels)
         self.out_strides = self.feat_strides
 
         self.input_projections = nn.ModuleList(
@@ -436,7 +449,7 @@ class HybridEncoder(nn.Module):
             None
         ]
 
-    def forward(self, features: Sequence[Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, features: Sequence[Tensor]) -> Tuple[Tensor, ...]:
         if len(features) != len(self.in_channels):
             raise ValueError(f"Expected {len(self.in_channels)} features, got {len(features)}")
         projected = [
@@ -484,7 +497,7 @@ class HybridEncoder(nn.Module):
                     torch.cat((downsampled, inner_outputs[feature_index + 1]), dim=1)
                 )
             )
-        return outputs[0], outputs[1], outputs[2]
+        return tuple(outputs)
 
 
 # -----------------------------------------------------------------------------
@@ -922,6 +935,12 @@ class RTDETRTransformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
         self.feat_strides = tuple(feat_strides)
+        if len(feat_channels) != len(self.feat_strides):
+            raise ValueError("feat_channels and feat_strides must have the same length")
+        if num_levels != len(feat_channels):
+            raise ValueError(
+                f"num_levels={num_levels} does not match {len(feat_channels)} feature levels"
+            )
         self.num_levels = num_levels
         self.num_decoder_layers = num_decoder_layers
         self.num_denoising = num_denoising
@@ -1022,7 +1041,12 @@ class RTDETRTransformer(nn.Module):
             grid_xy = torch.stack((grid_x, grid_y), dim=-1)
             valid_size = torch.tensor((width, height), device=device, dtype=dtype)
             grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_size
-            width_height = torch.ones_like(grid_xy) * grid_size * (2.0**level)
+            # Preserve the baseline RT-DETR anchor prior at each existing
+            # stride: P3/8=0.05, P4/16=0.10 and P5/32=0.20. Adding P2/4
+            # therefore introduces a 0.025 prior rather than shifting all
+            # existing priors one octave larger.
+            stride_scale = float(self.feat_strides[level]) / 8.0
+            width_height = torch.ones_like(grid_xy) * grid_size * stride_scale
             anchors.append(
                 torch.cat((grid_xy, width_height), dim=-1).reshape(1, -1, 4)
             )
@@ -1183,6 +1207,7 @@ class RTDETR(nn.Module):
         hidden_dim: int = 256,
         num_decoder_layers: int = 3,
         num_denoising: int = 100,
+        use_p2: bool = False,
     ) -> None:
         super().__init__()
         self.input_channels = input_channels
@@ -1191,7 +1216,8 @@ class RTDETR(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_decoder_layers = num_decoder_layers
         self.num_denoising = num_denoising
-        self.backbone = PResNet18(input_channels)
+        self.use_p2 = use_p2
+        self.backbone = PResNet18(input_channels, use_p2=use_p2)
         self.encoder = HybridEncoder(
             in_channels=self.backbone.out_channels,
             feat_strides=self.backbone.out_strides,
@@ -1204,6 +1230,7 @@ class RTDETR(nn.Module):
             num_queries=num_queries,
             feat_channels=self.encoder.out_channels,
             feat_strides=self.encoder.out_strides,
+            num_levels=len(self.encoder.out_channels),
             num_decoder_layers=num_decoder_layers,
             num_denoising=num_denoising,
         )

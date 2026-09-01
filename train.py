@@ -612,6 +612,7 @@ class ExperimentConfig:
     hidden_dim: int
     decoder_layers: int
     num_denoising: int
+    use_p2: bool
     seed: int
     pretrained: str
 
@@ -681,6 +682,17 @@ def load_pretrained_weights(
 
     if isinstance(checkpoint, Mapping) and "model" in checkpoint:
         state_dict = checkpoint["model"]
+        source_config = checkpoint.get("config", {})
+        if isinstance(source_config, Mapping):
+            source_use_p2 = bool(source_config.get("use_p2", False))
+            target_use_p2 = bool(getattr(model, "use_p2", False))
+            if source_use_p2 != target_use_p2:
+                raise ValueError(
+                    "Pretrained checkpoint architecture mismatch: "
+                    f"checkpoint use_p2={source_use_p2}, model use_p2={target_use_p2}. "
+                    "Use a checkpoint trained with the same feature-level layout, "
+                    "or omit --pretrained for a controlled from-scratch P2 experiment."
+                )
     else:
         state_dict = checkpoint
 
@@ -787,6 +799,7 @@ def train(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         num_decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
+        use_p2=args.use_p2,
     )
 
     if args.pretrained:
@@ -803,6 +816,7 @@ def train(args: argparse.Namespace) -> None:
     )
     print(f"Model parameters: {parameter_count:,}")
     print(f"Trainable parameters: {trainable_count:,}")
+    print(f"Feature strides: {model.backbone.out_strides}")
 
     matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
     criterion = SetCriterion(args.num_classes, matcher)
@@ -841,6 +855,7 @@ def train(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
+        use_p2=args.use_p2,
         seed=args.seed,
         pretrained=args.pretrained,
     )
@@ -951,6 +966,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--decoder-layers", type=int, default=3)
     parser.add_argument("--num-denoising", type=int, default=100)
+    parser.add_argument(
+        "--use-p2",
+        action="store_true",
+        help=(
+            "Add the stride-4 P2 backbone feature to the HybridEncoder and "
+            "4-level deformable decoder. Default keeps the P3-P5 baseline."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument(
         "--backbone-learning-rate",

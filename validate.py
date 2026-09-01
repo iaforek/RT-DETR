@@ -156,6 +156,7 @@ def build_model_from_checkpoint(
         hidden_dim=hidden_dim,
         num_decoder_layers=decoder_layers,
         num_denoising=int(config.get("num_denoising", 100)),
+        use_p2=bool(config.get("use_p2", False)),
     ).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     if not isinstance(state_dict, Mapping):
@@ -168,6 +169,7 @@ def build_model_from_checkpoint(
         "num_queries": num_queries,
         "hidden_dim": hidden_dim,
         "decoder_layers": decoder_layers,
+        "use_p2": bool(config.get("use_p2", False)),
     }
     return model, resolved
 
