@@ -128,6 +128,60 @@ class ConvNormLayer(nn.Module):
         return self.activation(self.norm(self.conv(x)))
 
 
+class SpaceToDepth(nn.Module):
+    """Rearrange 2x2 spatial samples into four channel groups.
+
+    This is the same slicing order used by LabSAINT/SPD-Conv:
+    (even, even), (odd, even), (even, odd), (odd, odd).
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"SpaceToDepth expects [B,C,H,W], got {tuple(x.shape)}")
+        height, width = x.shape[-2:]
+        if height % 2 or width % 2:
+            raise ValueError(
+                f"SpaceToDepth requires even spatial dimensions, got {height}x{width}"
+            )
+        return torch.cat(
+            (
+                x[..., ::2, ::2],
+                x[..., 1::2, ::2],
+                x[..., ::2, 1::2],
+                x[..., 1::2, 1::2],
+            ),
+            dim=1,
+        )
+
+
+class SPDConv(nn.Module):
+    """Space-to-Depth followed by a non-strided convolution."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        padding: int | None = None,
+        bias: bool = False,
+        activation: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.space_to_depth = SpaceToDepth()
+        self.conv = ConvNormLayer(
+            in_channels * 4,
+            out_channels,
+            kernel_size,
+            1,
+            padding=padding,
+            bias=bias,
+            activation=activation,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.conv(self.space_to_depth(x))
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -139,11 +193,16 @@ class BasicBlock(nn.Module):
         shortcut: bool,
         activation: str = "relu",
         variant: str = "d",
+        use_spd: bool = False,
     ) -> None:
         super().__init__()
         self.shortcut = shortcut
         if not shortcut:
-            if variant == "d" and stride == 2:
+            if use_spd and stride == 2:
+                # PResNet-D normally downsamples this shortcut with AvgPool2d.
+                # In SPD mode remove that pooling operation as well.
+                self.short = SPDConv(in_channels, out_channels, 1)
+            elif variant == "d" and stride == 2:
                 self.short = nn.Sequential(
                     OrderedDict(
                         [
@@ -154,12 +213,21 @@ class BasicBlock(nn.Module):
                 )
             else:
                 self.short = ConvNormLayer(in_channels, out_channels, 1, stride)
-        self.branch2a = ConvNormLayer(
-            in_channels,
-            out_channels,
-            3,
-            stride,
-            activation=activation,
+        self.branch2a = (
+            SPDConv(
+                in_channels,
+                out_channels,
+                3,
+                activation=activation,
+            )
+            if use_spd and stride == 2
+            else ConvNormLayer(
+                in_channels,
+                out_channels,
+                3,
+                stride,
+                activation=activation,
+            )
         )
         self.branch2b = ConvNormLayer(out_channels, out_channels, 3, 1)
         self.activation = get_activation(activation)
@@ -179,6 +247,7 @@ class ResidualStage(nn.Module):
         stage_number: int,
         activation: str = "relu",
         variant: str = "d",
+        use_spd: bool = False,
     ) -> None:
         super().__init__()
         blocks: List[nn.Module] = []
@@ -191,6 +260,7 @@ class ResidualStage(nn.Module):
                     shortcut=index != 0,
                     activation=activation,
                     variant=variant,
+                    use_spd=use_spd,
                 )
             )
             in_channels = out_channels
@@ -206,30 +276,44 @@ class PResNet18(nn.Module):
     By default the backbone exposes the standard RT-DETR stride-8, stride-16
     and stride-32 feature maps. ``use_p2=True`` additionally exposes the
     stride-4 stage (P2) so fine spatial detail can participate in cross-scale
-    fusion and decoder attention. No pretrained weights are loaded.
+    fusion and decoder attention. ``use_spd=True`` replaces factor-2 backbone
+    downsampling with SPD-Conv. No pretrained weights are loaded.
     """
 
-    def __init__(self, input_channels: int = 3, use_p2: bool = False) -> None:
+    def __init__(
+        self,
+        input_channels: int = 3,
+        use_p2: bool = False,
+        use_spd: bool = False,
+    ) -> None:
         super().__init__()
         self.use_p2 = use_p2
+        self.use_spd = use_spd
+        first_downsample: nn.Module = (
+            SPDConv(input_channels, 32, 3, activation="relu")
+            if use_spd
+            else ConvNormLayer(input_channels, 32, 3, 2, activation="relu")
+        )
         self.conv1 = nn.Sequential(
             OrderedDict(
                 [
-                    (
-                        "conv1_1",
-                        ConvNormLayer(input_channels, 32, 3, 2, activation="relu"),
-                    ),
+                    ("conv1_1", first_downsample),
                     ("conv1_2", ConvNormLayer(32, 32, 3, 1, activation="relu")),
                     ("conv1_3", ConvNormLayer(32, 64, 3, 1, activation="relu")),
                 ]
             )
         )
+        self.pool: nn.Module = (
+            SPDConv(64, 64, 3, activation="relu")
+            if use_spd
+            else nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
         self.stages = nn.ModuleList(
             [
-                ResidualStage(64, 64, 2, 2),
-                ResidualStage(64, 128, 2, 3),
-                ResidualStage(128, 256, 2, 4),
-                ResidualStage(256, 512, 2, 5),
+                ResidualStage(64, 64, 2, 2, use_spd=use_spd),
+                ResidualStage(64, 128, 2, 3, use_spd=use_spd),
+                ResidualStage(128, 256, 2, 4, use_spd=use_spd),
+                ResidualStage(256, 512, 2, 5, use_spd=use_spd),
             ]
         )
         if use_p2:
@@ -252,7 +336,7 @@ class PResNet18(nn.Module):
 
     def forward(self, x: Tensor) -> Tuple[Tensor, ...]:
         x = self.conv1(x)
-        x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = self.pool(x)
         outputs: List[Tensor] = []
         for stage_index, stage in enumerate(self.stages):
             x = stage(x)
@@ -354,10 +438,12 @@ class HybridEncoder(nn.Module):
         num_encoder_layers: int = 1,
         expansion: float = 0.5,
         depth_mult: float = 1.0,
+        use_spd: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = tuple(in_channels)
         self.feat_strides = tuple(feat_strides)
+        self.use_spd = use_spd
         if len(self.in_channels) != len(self.feat_strides):
             raise ValueError("in_channels and feat_strides must have the same length")
         if len(self.in_channels) < 2:
@@ -409,7 +495,11 @@ class HybridEncoder(nn.Module):
         )
         self.downsample_convs = nn.ModuleList(
             [
-                ConvNormLayer(hidden_dim, hidden_dim, 3, 2, activation="silu")
+                (
+                    SPDConv(hidden_dim, hidden_dim, 3, activation="silu")
+                    if use_spd
+                    else ConvNormLayer(hidden_dim, hidden_dim, 3, 2, activation="silu")
+                )
                 for _ in range(len(in_channels) - 1)
             ]
         )
@@ -1208,6 +1298,7 @@ class RTDETR(nn.Module):
         num_decoder_layers: int = 3,
         num_denoising: int = 100,
         use_p2: bool = False,
+        use_spd: bool = False,
     ) -> None:
         super().__init__()
         self.input_channels = input_channels
@@ -1217,12 +1308,18 @@ class RTDETR(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.num_denoising = num_denoising
         self.use_p2 = use_p2
-        self.backbone = PResNet18(input_channels, use_p2=use_p2)
+        self.use_spd = use_spd
+        self.backbone = PResNet18(
+            input_channels,
+            use_p2=use_p2,
+            use_spd=use_spd,
+        )
         self.encoder = HybridEncoder(
             in_channels=self.backbone.out_channels,
             feat_strides=self.backbone.out_strides,
             hidden_dim=hidden_dim,
             expansion=0.5,
+            use_spd=use_spd,
         )
         self.decoder = RTDETRTransformer(
             num_classes=num_classes,

@@ -613,6 +613,7 @@ class ExperimentConfig:
     decoder_layers: int
     num_denoising: int
     use_p2: bool
+    use_spd: bool
     seed: int
     pretrained: str
 
@@ -692,6 +693,15 @@ def load_pretrained_weights(
                     f"checkpoint use_p2={source_use_p2}, model use_p2={target_use_p2}. "
                     "Use a checkpoint trained with the same feature-level layout, "
                     "or omit --pretrained for a controlled from-scratch P2 experiment."
+                )
+            source_use_spd = bool(source_config.get("use_spd", False))
+            target_use_spd = bool(getattr(model, "use_spd", False))
+            if source_use_spd != target_use_spd:
+                raise ValueError(
+                    "Pretrained checkpoint architecture mismatch: "
+                    f"checkpoint use_spd={source_use_spd}, model use_spd={target_use_spd}. "
+                    "Use a checkpoint trained with the same downsampling layout, "
+                    "or omit --pretrained for a controlled from-scratch SPD experiment."
                 )
     else:
         state_dict = checkpoint
@@ -800,6 +810,7 @@ def train(args: argparse.Namespace) -> None:
         num_decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
         use_p2=args.use_p2,
+        use_spd=args.use_spd,
     )
 
     if args.pretrained:
@@ -817,6 +828,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Model parameters: {parameter_count:,}")
     print(f"Trainable parameters: {trainable_count:,}")
     print(f"Feature strides: {model.backbone.out_strides}")
+    print(f"P2 feature level: {'enabled' if args.use_p2 else 'disabled'}")
+    print(f"SPD-Conv downsampling: {'enabled' if args.use_spd else 'disabled'}")
 
     matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
     criterion = SetCriterion(args.num_classes, matcher)
@@ -856,6 +869,7 @@ def train(args: argparse.Namespace) -> None:
         decoder_layers=args.decoder_layers,
         num_denoising=args.num_denoising,
         use_p2=args.use_p2,
+        use_spd=args.use_spd,
         seed=args.seed,
         pretrained=args.pretrained,
     )
@@ -972,6 +986,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Add the stride-4 P2 backbone feature to the HybridEncoder and "
             "4-level deformable decoder. Default keeps the P3-P5 baseline."
+        ),
+    )
+    parser.add_argument(
+        "--use-spd",
+        action="store_true",
+        help=(
+            "Replace factor-2 PResNet and bottom-up PAN downsampling with "
+            "Space-to-Depth followed by a stride-1 convolution."
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)

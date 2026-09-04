@@ -157,6 +157,7 @@ def build_model_from_checkpoint(
         num_decoder_layers=decoder_layers,
         num_denoising=int(config.get("num_denoising", 100)),
         use_p2=bool(config.get("use_p2", False)),
+        use_spd=bool(config.get("use_spd", False)),
     ).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     if not isinstance(state_dict, Mapping):
@@ -170,6 +171,7 @@ def build_model_from_checkpoint(
         "hidden_dim": hidden_dim,
         "decoder_layers": decoder_layers,
         "use_p2": bool(config.get("use_p2", False)),
+        "use_spd": bool(config.get("use_spd", False)),
     }
     return model, resolved
 
@@ -1527,6 +1529,8 @@ def validate_dataset(args: argparse.Namespace) -> None:
     print("Model: RT-DETR-R18")
     print(f"Object queries: {config['num_queries']}")
     print(f"Decoder layers: {config['decoder_layers']}")
+    print(f"P2 feature level: {'enabled' if config.get('use_p2', False) else 'disabled'}")
+    print(f"SPD-Conv downsampling: {'enabled' if config.get('use_spd', False) else 'disabled'}")
     print(f"Maximum detections per image: {args.max_detections}")
     print(f"AMP inference: {amp_enabled}")
 
@@ -1590,6 +1594,8 @@ def validate_dataset(args: argparse.Namespace) -> None:
             "model": "RT-DETR-R18",
             "num_queries": config["num_queries"],
             "decoder_layers": config["decoder_layers"],
+            "use_p2": bool(config.get("use_p2", False)),
+            "use_spd": bool(config.get("use_spd", False)),
             "max_detections": args.max_detections,
             "inference_seconds": inference_seconds,
             "milliseconds_per_image": milliseconds_per_image,
