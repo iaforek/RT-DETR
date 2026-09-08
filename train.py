@@ -614,6 +614,7 @@ class ExperimentConfig:
     num_denoising: int
     use_p2: bool
     use_spd: bool
+    use_s2_fusion: bool
     seed: int
     pretrained: str
 
@@ -702,6 +703,16 @@ def load_pretrained_weights(
                     f"checkpoint use_spd={source_use_spd}, model use_spd={target_use_spd}. "
                     "Use a checkpoint trained with the same downsampling layout, "
                     "or omit --pretrained for a controlled from-scratch SPD experiment."
+                )
+            source_use_s2_fusion = bool(source_config.get("use_s2_fusion", False))
+            target_use_s2_fusion = bool(getattr(model, "use_s2_fusion", False))
+            if source_use_s2_fusion != target_use_s2_fusion:
+                raise ValueError(
+                    "Pretrained checkpoint architecture mismatch: "
+                    f"checkpoint use_s2_fusion={source_use_s2_fusion}, "
+                    f"model use_s2_fusion={target_use_s2_fusion}. "
+                    "Use a checkpoint trained with the same S2-fusion layout, "
+                    "or omit --pretrained for a controlled from-scratch S2-fusion experiment."
                 )
     else:
         state_dict = checkpoint
@@ -811,6 +822,7 @@ def train(args: argparse.Namespace) -> None:
         num_denoising=args.num_denoising,
         use_p2=args.use_p2,
         use_spd=args.use_spd,
+        use_s2_fusion=args.use_s2_fusion,
     )
 
     if args.pretrained:
@@ -830,6 +842,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Feature strides: {model.backbone.out_strides}")
     print(f"P2 feature level: {'enabled' if args.use_p2 else 'disabled'}")
     print(f"SPD-Conv downsampling: {'enabled' if args.use_spd else 'disabled'}")
+    print(f"SO-DETR-style S2 fusion: {'enabled' if args.use_s2_fusion else 'disabled'}")
+    print(f"Encoder output strides: {model.encoder.out_strides}")
 
     matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
     criterion = SetCriterion(args.num_classes, matcher)
@@ -870,6 +884,7 @@ def train(args: argparse.Namespace) -> None:
         num_denoising=args.num_denoising,
         use_p2=args.use_p2,
         use_spd=args.use_spd,
+        use_s2_fusion=args.use_s2_fusion,
         seed=args.seed,
         pretrained=args.pretrained,
     )
@@ -996,6 +1011,16 @@ def parse_args() -> argparse.Namespace:
             "Space-to-Depth followed by a stride-1 convolution."
         ),
     )
+    parser.add_argument(
+        "--use-s2-fusion",
+        action="store_true",
+        help=(
+            "SO-DETR-style S2/P2 fusion without DDF: keep conventional "
+            "backbone/PAN downsampling, SPD-downsample S2 to P3 resolution, "
+            "and fuse it with raw S3 and the top-down P4 feature. The decoder "
+            "remains P3-P5 (three levels)."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument(
         "--backbone-learning-rate",
@@ -1035,6 +1060,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decoder-layers must be positive and --num-denoising non-negative")
     if args.resume and args.pretrained:
         parser.error("--resume and --pretrained cannot be used together")
+    if args.use_s2_fusion and (args.use_p2 or args.use_spd):
+        parser.error(
+            "--use-s2-fusion is a separate SO-DETR-style experiment; "
+            "do not combine it with --use-p2 or --use-spd"
+        )
     return args
 
 

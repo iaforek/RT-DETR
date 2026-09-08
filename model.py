@@ -277,7 +277,9 @@ class PResNet18(nn.Module):
     and stride-32 feature maps. ``use_p2=True`` additionally exposes the
     stride-4 stage (P2) so fine spatial detail can participate in cross-scale
     fusion and decoder attention. ``use_spd=True`` replaces factor-2 backbone
-    downsampling with SPD-Conv. No pretrained weights are loaded.
+    downsampling with SPD-Conv. ``use_s2_fusion=True`` exposes S2 only as an
+    auxiliary source for SO-DETR-style S2->P3 fusion; it does not make S2 a
+    fourth decoder feature level. No pretrained weights are loaded.
     """
 
     def __init__(
@@ -285,10 +287,23 @@ class PResNet18(nn.Module):
         input_channels: int = 3,
         use_p2: bool = False,
         use_spd: bool = False,
+        use_s2_fusion: bool = False,
     ) -> None:
         super().__init__()
+        if use_s2_fusion and use_p2:
+            raise ValueError(
+                "use_s2_fusion and use_p2 are mutually exclusive: "
+                "S2 fusion injects S2 into P3 while keeping a 3-level decoder."
+            )
+        if use_s2_fusion and use_spd:
+            raise ValueError(
+                "use_s2_fusion and use_spd are mutually exclusive for the "
+                "SO-DETR-style experiment: keep conventional backbone/PAN "
+                "downsampling and use SPDConv only on the S2 fusion branch."
+            )
         self.use_p2 = use_p2
         self.use_spd = use_spd
+        self.use_s2_fusion = use_s2_fusion
         first_downsample: nn.Module = (
             SPDConv(input_channels, 32, 3, activation="relu")
             if use_spd
@@ -316,7 +331,10 @@ class PResNet18(nn.Module):
                 ResidualStage(256, 512, 2, 5, use_spd=use_spd),
             ]
         )
-        if use_p2:
+        if use_p2 or use_s2_fusion:
+            # use_p2 exposes S2 as a true fourth decoder level.
+            # use_s2_fusion exposes the same backbone tensor only so the
+            # encoder can SPD-downsample it and inject it into P3.
             self.return_stage_indices = (0, 1, 2, 3)
             self.out_channels = (64, 128, 256, 512)
             self.out_strides = (4, 8, 16, 32)
@@ -588,6 +606,206 @@ class HybridEncoder(nn.Module):
                 )
             )
         return tuple(outputs)
+
+
+class S2FusionHybridEncoder(nn.Module):
+    """SO-DETR-style S2/P2 fusion without the frequency-domain DDF block.
+
+    The conventional PResNet backbone supplies S2, S3, S4 and S5. S2 is
+    downsampled once with SPDConv to the S3/P3 spatial resolution and then
+    concatenated with the raw S3 feature and the top-down P4 feature. The
+    concatenated tensor is processed by the existing CSPRepLayer instead of
+    SO-DETR's DDF + RepC3 sequence.
+
+    Crucially, the encoder still outputs only P3, P4 and P5. S2 is therefore
+    an auxiliary fusion source, not a fourth deformable-attention level.
+    Bottom-up PAN downsampling remains conventional stride-2 convolution,
+    matching the placement of SPDConv in SO-DETR more closely than use_spd.
+    """
+
+    def __init__(
+        self,
+        in_channels: Sequence[int] = (64, 128, 256, 512),
+        feat_strides: Sequence[int] = (4, 8, 16, 32),
+        hidden_dim: int = 256,
+        nhead: int = 8,
+        dim_feedforward: int = 1024,
+        num_encoder_layers: int = 1,
+        expansion: float = 0.5,
+        depth_mult: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.in_channels = tuple(in_channels)
+        self.feat_strides = tuple(feat_strides)
+        if len(self.in_channels) != 4 or len(self.feat_strides) != 4:
+            raise ValueError(
+                "S2FusionHybridEncoder expects exactly S2-S5 (four feature levels)"
+            )
+        if self.feat_strides != (4, 8, 16, 32):
+            raise ValueError(
+                "S2FusionHybridEncoder expects feature strides (4, 8, 16, 32)"
+            )
+
+        s2_channels, s3_channels, s4_channels, s5_channels = self.in_channels
+        self.hidden_dim = hidden_dim
+        self.out_channels = (hidden_dim, hidden_dim, hidden_dim)
+        self.out_strides = (8, 16, 32)
+
+        # SO-DETR keeps raw S3 at 128 channels and maps S2 to the same channel
+        # width before concatenation. Using the actual S3 width keeps this
+        # implementation robust to the backbone channel declaration.
+        self.s2_downsample = SPDConv(
+            s2_channels,
+            s3_channels,
+            3,
+            activation="silu",
+        )
+
+        # SO-DETR projects S4 and S5 to the encoder hidden width, while raw S3
+        # participates directly in the S2-assisted P3 fusion.
+        self.s4_projection = nn.Sequential(
+            nn.Conv2d(s4_channels, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+        )
+        self.s5_projection = nn.Sequential(
+            nn.Conv2d(s5_channels, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+        )
+        self.aifi_layers = nn.ModuleList(
+            [
+                TransformerEncoderLayer(
+                    hidden_dim,
+                    nhead,
+                    dim_feedforward,
+                    dropout=0.0,
+                    activation="gelu",
+                )
+                for _ in range(num_encoder_layers)
+            ]
+        )
+
+        blocks = max(1, round(3 * depth_mult))
+
+        # P5 -> P4 top-down path, corresponding to SO-DETR layers 10-14.
+        self.p5_lateral = ConvNormLayer(
+            hidden_dim,
+            hidden_dim,
+            1,
+            1,
+            activation="silu",
+        )
+        self.p4_fpn = CSPRepLayer(
+            hidden_dim * 2,
+            hidden_dim,
+            blocks,
+            expansion,
+            activation="silu",
+        )
+
+        # Reduce the P4 top-down feature to S3's width before the final P3
+        # fusion. At RT-DETR-R18 defaults this is 256 -> 128, as in SO-DETR.
+        self.p4_lateral = ConvNormLayer(
+            hidden_dim,
+            s3_channels,
+            1,
+            1,
+            activation="silu",
+        )
+
+        # SO-DETR applies DDF after concatenating SPD(S2), upsampled P4 and S3,
+        # then RepC3. This controlled ablation deliberately omits DDF and sends
+        # the same three-way concatenation directly to the local Rep-style block.
+        self.p3_fusion = CSPRepLayer(
+            s3_channels * 3,
+            hidden_dim,
+            blocks,
+            expansion,
+            activation="silu",
+        )
+
+        # Keep ordinary stride-2 PAN downsampling, matching SO-DETR rather than
+        # the repository's separate use_spd experiment.
+        self.p3_downsample = ConvNormLayer(
+            hidden_dim,
+            hidden_dim,
+            3,
+            2,
+            activation="silu",
+        )
+        self.p4_pan = CSPRepLayer(
+            hidden_dim + s3_channels,
+            hidden_dim,
+            blocks,
+            expansion,
+            activation="silu",
+        )
+        self.p4_downsample = ConvNormLayer(
+            hidden_dim,
+            hidden_dim,
+            3,
+            2,
+            activation="silu",
+        )
+        self.p5_pan = CSPRepLayer(
+            hidden_dim * 2,
+            hidden_dim,
+            blocks,
+            expansion,
+            activation="silu",
+        )
+
+    def _apply_aifi(self, feature: Tensor) -> Tensor:
+        height, width = feature.shape[-2:]
+        tokens = feature.flatten(2).permute(0, 2, 1)
+        position = HybridEncoder.build_2d_sincos_position_embedding(
+            width,
+            height,
+            self.hidden_dim,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        for layer in self.aifi_layers:
+            tokens = layer(tokens, position)
+        return tokens.permute(0, 2, 1).reshape(
+            feature.shape[0], self.hidden_dim, height, width
+        )
+
+    def forward(self, features: Sequence[Tensor]) -> Tuple[Tensor, ...]:
+        if len(features) != 4:
+            raise ValueError(f"Expected S2-S5 (4 features), got {len(features)}")
+        s2, s3, s4, s5 = features
+
+        p5_projected = self._apply_aifi(self.s5_projection(s5))
+        p4_projected = self.s4_projection(s4)
+
+        y5 = self.p5_lateral(p5_projected)
+        p4_top_down = self.p4_fpn(
+            torch.cat(
+                (
+                    F.interpolate(y5, scale_factor=2.0, mode="nearest"),
+                    p4_projected,
+                ),
+                dim=1,
+            )
+        )
+
+        y4 = self.p4_lateral(p4_top_down)
+        s2_aligned = self.s2_downsample(s2)
+        y4_upsampled = F.interpolate(y4, scale_factor=2.0, mode="nearest")
+
+        # Same three sources as SO-DETR's S2-assisted P3 fusion, but without DDF:
+        # SPD(S2) + upsampled top-down P4 + raw S3.
+        p3 = self.p3_fusion(
+            torch.cat((s2_aligned, y4_upsampled, s3), dim=1)
+        )
+
+        p4 = self.p4_pan(
+            torch.cat((self.p3_downsample(p3), y4), dim=1)
+        )
+        p5 = self.p5_pan(
+            torch.cat((self.p4_downsample(p4), y5), dim=1)
+        )
+        return p3, p4, p5
 
 
 # -----------------------------------------------------------------------------
@@ -1299,8 +1517,14 @@ class RTDETR(nn.Module):
         num_denoising: int = 100,
         use_p2: bool = False,
         use_spd: bool = False,
+        use_s2_fusion: bool = False,
     ) -> None:
         super().__init__()
+        if use_s2_fusion and (use_p2 or use_spd):
+            raise ValueError(
+                "use_s2_fusion is a separate SO-DETR-style experiment and "
+                "cannot be combined with use_p2 or use_spd."
+            )
         self.input_channels = input_channels
         self.num_classes = num_classes
         self.num_queries = num_queries
@@ -1309,18 +1533,28 @@ class RTDETR(nn.Module):
         self.num_denoising = num_denoising
         self.use_p2 = use_p2
         self.use_spd = use_spd
+        self.use_s2_fusion = use_s2_fusion
         self.backbone = PResNet18(
             input_channels,
             use_p2=use_p2,
             use_spd=use_spd,
+            use_s2_fusion=use_s2_fusion,
         )
-        self.encoder = HybridEncoder(
-            in_channels=self.backbone.out_channels,
-            feat_strides=self.backbone.out_strides,
-            hidden_dim=hidden_dim,
-            expansion=0.5,
-            use_spd=use_spd,
-        )
+        if use_s2_fusion:
+            self.encoder: nn.Module = S2FusionHybridEncoder(
+                in_channels=self.backbone.out_channels,
+                feat_strides=self.backbone.out_strides,
+                hidden_dim=hidden_dim,
+                expansion=0.5,
+            )
+        else:
+            self.encoder = HybridEncoder(
+                in_channels=self.backbone.out_channels,
+                feat_strides=self.backbone.out_strides,
+                hidden_dim=hidden_dim,
+                expansion=0.5,
+                use_spd=use_spd,
+            )
         self.decoder = RTDETRTransformer(
             num_classes=num_classes,
             hidden_dim=hidden_dim,
