@@ -159,6 +159,7 @@ def build_model_from_checkpoint(
         use_p2=bool(config.get("use_p2", False)),
         use_spd=bool(config.get("use_spd", False)),
         use_s2_fusion=bool(config.get("use_s2_fusion", False)),
+        use_spd_detr=bool(config.get("use_spd_detr", False)),
     ).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     if not isinstance(state_dict, Mapping):
@@ -174,6 +175,7 @@ def build_model_from_checkpoint(
         "use_p2": bool(config.get("use_p2", False)),
         "use_spd": bool(config.get("use_spd", False)),
         "use_s2_fusion": bool(config.get("use_s2_fusion", False)),
+        "use_spd_detr": bool(config.get("use_spd_detr", False)),
     }
     return model, resolved
 
@@ -1528,7 +1530,11 @@ def validate_dataset(args: argparse.Namespace) -> None:
     print(f"Images: {len(dataset)}")
     print(f"Image size: {img_size}")
     print(f"Classes: {num_classes}")
-    print("Model: RT-DETR-R18")
+    print(
+        "Model: SPD-DETR reconstruction"
+        if config.get("use_spd_detr", False)
+        else "Model: RT-DETR-R18"
+    )
     print(f"Object queries: {config['num_queries']}")
     print(f"Decoder layers: {config['decoder_layers']}")
     print(f"P2 feature level: {'enabled' if config.get('use_p2', False) else 'disabled'}")
@@ -1536,6 +1542,10 @@ def validate_dataset(args: argparse.Namespace) -> None:
     print(
         "SO-DETR-style S2 fusion: "
         f"{'enabled' if config.get('use_s2_fusion', False) else 'disabled'}"
+    )
+    print(
+        "SPD-DETR reconstruction: "
+        f"{'enabled' if config.get('use_spd_detr', False) else 'disabled'}"
     )
     print(f"Maximum detections per image: {args.max_detections}")
     print(f"AMP inference: {amp_enabled}")
@@ -1597,12 +1607,17 @@ def validate_dataset(args: argparse.Namespace) -> None:
             "images": image_count,
             "img_size": img_size,
             "num_classes": num_classes,
-            "model": "RT-DETR-R18",
+            "model": (
+                "SPD-DETR reconstruction"
+                if config.get("use_spd_detr", False)
+                else "RT-DETR-R18"
+            ),
             "num_queries": config["num_queries"],
             "decoder_layers": config["decoder_layers"],
             "use_p2": bool(config.get("use_p2", False)),
             "use_spd": bool(config.get("use_spd", False)),
             "use_s2_fusion": bool(config.get("use_s2_fusion", False)),
+            "use_spd_detr": bool(config.get("use_spd_detr", False)),
             "max_detections": args.max_detections,
             "inference_seconds": inference_seconds,
             "milliseconds_per_image": milliseconds_per_image,

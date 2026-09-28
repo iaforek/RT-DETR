@@ -182,6 +182,165 @@ class SPDConv(nn.Module):
         return self.conv(self.space_to_depth(x))
 
 
+
+# -----------------------------------------------------------------------------
+# Paper-guided SPD-DETR reconstruction components
+# -----------------------------------------------------------------------------
+
+
+class FasterNetPartialConv(nn.Module):
+    """Partial 3x3 spatial mixing from the official FasterNet design.
+
+    Only one quarter of the channels are processed by the 3x3 convolution;
+    the remaining channels are passed through unchanged.
+    """
+
+    def __init__(self, channels: int, n_div: int = 4) -> None:
+        super().__init__()
+        if channels % n_div != 0:
+            raise ValueError("FasterNetPartialConv requires channels divisible by n_div")
+        self.conv_channels = channels // n_div
+        self.untouched_channels = channels - self.conv_channels
+        self.partial_conv = nn.Conv2d(
+            self.conv_channels,
+            self.conv_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        convolved, untouched = torch.split(
+            x,
+            [self.conv_channels, self.untouched_channels],
+            dim=1,
+        )
+        convolved = self.partial_conv(convolved)
+        return torch.cat((convolved, untouched), dim=1)
+
+
+class FasterNetBlock(nn.Module):
+    """FasterNet T0-style MLP block with partial-convolution spatial mixing."""
+
+    def __init__(
+        self,
+        channels: int,
+        mlp_ratio: float = 2.0,
+        n_div: int = 4,
+        activation: str = "gelu",
+    ) -> None:
+        super().__init__()
+        hidden_channels = int(channels * mlp_ratio)
+        self.spatial_mixing = FasterNetPartialConv(channels, n_div=n_div)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            get_activation(activation),
+            nn.Conv2d(hidden_channels, channels, 1, bias=False),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        shortcut = x
+        x = self.spatial_mixing(x)
+        return shortcut + self.mlp(x)
+
+
+class SPDFasterNetT0(nn.Module):
+    """Paper-guided reconstruction of the SPD-FasterNet backbone in SPD-DETR.
+
+    IMPORTANT: the authors' SPD-DETR source code is not publicly available at
+    the time this reconstruction was written, and the accessible paper summary
+    says that SPDConv "replaces partial convolution". In official FasterNet,
+    however, PConv is stride-1 and is used repeatedly inside residual blocks;
+    replacing every PConv literally with a factor-2 SPDConv would repeatedly
+    halve H/W and break the residual path.
+
+    Therefore this *reconstruction* keeps FasterNet-T0's PConv spatial-mixing
+    blocks and applies SPDConv at every spatial downsampling transition. The
+    initial stride-4 patch embedding is represented as two factor-2 SPDConv
+    steps, and the three FasterNet patch-merging transitions are SPDConv.
+    This preserves the paper's stated objective (fine-detail-preserving
+    downsampling with a lightweight FasterNet backbone) without pretending to
+    be the unavailable author implementation.
+
+    Output levels follow RT-DETR convention: S3/S4/S5 at strides 8/16/32.
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 3,
+        embed_dim: int = 40,
+        depths: Sequence[int] = (1, 2, 8, 2),
+        mlp_ratio: float = 2.0,
+        n_div: int = 4,
+    ) -> None:
+        super().__init__()
+        if len(depths) != 4:
+            raise ValueError("SPDFasterNetT0 expects four stage depths")
+        self.embed_dim = embed_dim
+        self.depths = tuple(int(depth) for depth in depths)
+
+        stem_mid = max(embed_dim // 2, 8)
+        self.patch_embed = nn.Sequential(
+            SPDConv(input_channels, stem_mid, 3, activation="gelu"),
+            SPDConv(stem_mid, embed_dim, 3, activation="gelu"),
+        )
+
+        stage_dims = [embed_dim * (2**index) for index in range(4)]
+        self.stages = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        for stage_index, (channels, depth) in enumerate(zip(stage_dims, self.depths)):
+            self.stages.append(
+                nn.Sequential(
+                    *[
+                        FasterNetBlock(
+                            channels,
+                            mlp_ratio=mlp_ratio,
+                            n_div=n_div,
+                            activation="gelu",
+                        )
+                        for _ in range(depth)
+                    ]
+                )
+            )
+            if stage_index < 3:
+                self.downsamples.append(
+                    SPDConv(
+                        channels,
+                        stage_dims[stage_index + 1],
+                        3,
+                        activation="gelu",
+                    )
+                )
+
+        # Stage 0 is S2/stride-4. RT-DETR consumes S3-S5 by default.
+        self.out_channels = tuple(stage_dims[1:])
+        self.out_strides = (8, 16, 32)
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, ...]:
+        x = self.patch_embed(x)
+        outputs: List[Tensor] = []
+        for stage_index, stage in enumerate(self.stages):
+            x = stage(x)
+            if stage_index >= 1:
+                outputs.append(x)
+            if stage_index < len(self.downsamples):
+                x = self.downsamples[stage_index](x)
+        return tuple(outputs)
+
+
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -443,6 +602,388 @@ class TransformerEncoderLayer(nn.Module):
         source = self.norm1(source + self.dropout1(attended))
         feedforward = self.linear2(self.dropout(self.activation(self.linear1(source))))
         return self.norm2(source + self.dropout2(feedforward))
+
+
+
+class ReconstructedSCAA(nn.Module):
+    """Paper-guided Spatial-Channel Aggregation Attention approximation.
+
+    The accessible SPD-DETR description states that SCAA optimises important
+    spatial locations and channel features *in parallel*, but the exact author
+    implementation/equations are not publicly available. This reconstruction
+    uses parallel channel and spatial attention branches, concatenates their
+    attended features, fuses them with a 1x1 convolution, and adds a residual.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        hidden_channels = max(channels // reduction, 8)
+        self.channel_mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, 1, bias=False),
+        )
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+        self.fusion = ConvNormLayer(
+            channels * 2,
+            channels,
+            1,
+            1,
+            activation="silu",
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        avg_descriptor = F.adaptive_avg_pool2d(x, 1)
+        max_descriptor = F.adaptive_max_pool2d(x, 1)
+        channel_weight = torch.sigmoid(
+            self.channel_mlp(avg_descriptor) + self.channel_mlp(max_descriptor)
+        )
+
+        spatial_descriptor = torch.cat(
+            (x.mean(dim=1, keepdim=True), x.amax(dim=1, keepdim=True)),
+            dim=1,
+        )
+        spatial_weight = torch.sigmoid(self.spatial_conv(spatial_descriptor))
+
+        channel_feature = x * channel_weight
+        spatial_feature = x * spatial_weight
+        return x + self.fusion(torch.cat((channel_feature, spatial_feature), dim=1))
+
+
+class LayerNorm2d(nn.Module):
+    """Layer normalization across channels for NCHW feature maps."""
+
+    def __init__(self, channels: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        mean = x.mean(dim=1, keepdim=True)
+        variance = (x - mean).pow(2).mean(dim=1, keepdim=True)
+        normalized = (x - mean) / torch.sqrt(variance + self.eps)
+        return (
+            self.weight[:, None, None] * normalized
+            + self.bias[:, None, None]
+        )
+
+
+class HiLoAttention2d(nn.Module):
+    """2-D HiLo attention adapted from the public LITv2 design.
+
+    High-frequency heads perform local window attention. Low-frequency heads
+    query the full feature map while keys/values are spatially average-pooled.
+    Padding is applied internally so odd RT-DETR feature sizes (e.g. 13x13 at
+    416 input) are supported with a 2x2 HiLo window.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        window_size: int = 2,
+        alpha: float = 0.5,
+        qkv_bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("HiLoAttention2d requires dim divisible by num_heads")
+        if window_size < 1:
+            raise ValueError("window_size must be positive")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        low_heads = int(num_heads * alpha)
+        low_heads = min(max(low_heads, 0), num_heads)
+        high_heads = num_heads - low_heads
+        if window_size == 1:
+            low_heads = num_heads
+            high_heads = 0
+        self.low_heads = low_heads
+        self.high_heads = high_heads
+        self.low_dim = low_heads * self.head_dim
+        self.high_dim = high_heads * self.head_dim
+
+        if self.high_heads > 0:
+            self.high_qkv = nn.Linear(dim, self.high_dim * 3, bias=qkv_bias)
+            self.high_proj = nn.Linear(self.high_dim, self.high_dim, bias=True)
+        if self.low_heads > 0:
+            self.low_q = nn.Conv2d(dim, self.low_dim, 1, bias=qkv_bias)
+            self.low_kv = nn.Conv2d(dim, self.low_dim * 2, 1, bias=qkv_bias)
+            self.low_proj = nn.Conv2d(self.low_dim, self.low_dim, 1, bias=True)
+        self.output_proj = nn.Conv2d(dim, dim, 1, bias=True)
+
+    def _high_frequency(self, x: Tensor) -> Tensor:
+        batch, channels, height, width = x.shape
+        ws = self.window_size
+        height_windows = height // ws
+        width_windows = width // ws
+        windows = (
+            x.permute(0, 2, 3, 1)
+            .reshape(batch, height_windows, ws, width_windows, ws, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(batch * height_windows * width_windows, ws * ws, channels)
+        )
+        qkv = self.high_qkv(windows)
+        qkv = qkv.reshape(
+            windows.shape[0],
+            windows.shape[1],
+            3,
+            self.high_heads,
+            self.head_dim,
+        ).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(0)
+        attention = (query * self.scale) @ key.transpose(-2, -1)
+        attention = attention.softmax(dim=-1)
+        output = (attention @ value).transpose(1, 2).reshape(
+            windows.shape[0],
+            ws * ws,
+            self.high_dim,
+        )
+        output = self.high_proj(output)
+        output = (
+            output.reshape(
+                batch,
+                height_windows,
+                width_windows,
+                ws,
+                ws,
+                self.high_dim,
+            )
+            .permute(0, 5, 1, 3, 2, 4)
+            .reshape(batch, self.high_dim, height, width)
+        )
+        return output
+
+    def _low_frequency(self, x: Tensor) -> Tensor:
+        batch, _, height, width = x.shape
+        query = self.low_q(x).reshape(
+            batch,
+            self.low_heads,
+            self.head_dim,
+            height * width,
+        ).permute(0, 1, 3, 2)
+
+        if self.window_size > 1:
+            pooled = F.avg_pool2d(
+                x,
+                kernel_size=self.window_size,
+                stride=self.window_size,
+            )
+        else:
+            pooled = x
+        pooled_height, pooled_width = pooled.shape[-2:]
+        key_value = self.low_kv(pooled).reshape(
+            batch,
+            2,
+            self.low_heads,
+            self.head_dim,
+            pooled_height * pooled_width,
+        ).permute(1, 0, 2, 4, 3)
+        key, value = key_value.unbind(0)
+        attention = (query * self.scale) @ key.transpose(-2, -1)
+        attention = attention.softmax(dim=-1)
+        output = attention @ value
+        output = output.permute(0, 1, 3, 2).reshape(
+            batch,
+            self.low_dim,
+            height,
+            width,
+        )
+        return self.low_proj(output)
+
+    def forward(self, x: Tensor) -> Tensor:
+        original_height, original_width = x.shape[-2:]
+        ws = self.window_size
+        pad_height = (ws - original_height % ws) % ws
+        pad_width = (ws - original_width % ws) % ws
+        if pad_height or pad_width:
+            x = F.pad(x, (0, pad_width, 0, pad_height))
+
+        branches: List[Tensor] = []
+        if self.high_heads > 0:
+            branches.append(self._high_frequency(x))
+        if self.low_heads > 0:
+            branches.append(self._low_frequency(x))
+        output = torch.cat(branches, dim=1)
+        output = self.output_proj(output)
+        return output[..., :original_height, :original_width]
+
+
+class AIFIHiLo(nn.Module):
+    """AIFI reconstruction in which MHSA is replaced by HiLo attention."""
+
+    def __init__(
+        self,
+        channels: int = 256,
+        dim_feedforward: int = 1024,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        window_size: int = 2,
+        alpha: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.attention = HiLoAttention2d(
+            channels,
+            num_heads=num_heads,
+            window_size=window_size,
+            alpha=alpha,
+        )
+        self.fc1 = nn.Conv2d(channels, dim_feedforward, 1)
+        self.fc2 = nn.Conv2d(dim_feedforward, channels, 1)
+        self.norm1 = LayerNorm2d(channels)
+        self.norm2 = LayerNorm2d(channels)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        attended = self.attention(x)
+        x = self.norm1(x + self.dropout1(attended))
+        feedforward = self.fc2(self.dropout(self.activation(self.fc1(x))))
+        return self.norm2(x + self.dropout2(feedforward))
+
+
+class SPDETRHybridEncoder(nn.Module):
+    """SPD-DETR-style reconstructed encoder: SCAA + HiLo-AIFI + RT-DETR CCFF.
+
+    SCAA placement and exact internals are inferred from the accessible paper
+    description because the authors' implementation is unavailable. The
+    cross-scale FPN/PAN remains the repository's standard RT-DETR CCFF so the
+    comparison isolates the SPD-FasterNet, SCAA, and HiLo-AIFI changes.
+    """
+
+    def __init__(
+        self,
+        in_channels: Sequence[int] = (80, 160, 320),
+        feat_strides: Sequence[int] = (8, 16, 32),
+        hidden_dim: int = 256,
+        nhead: int = 8,
+        dim_feedforward: int = 1024,
+        num_encoder_layers: int = 1,
+        expansion: float = 0.5,
+        depth_mult: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.in_channels = tuple(in_channels)
+        self.feat_strides = tuple(feat_strides)
+        if len(self.in_channels) != 3 or self.feat_strides != (8, 16, 32):
+            raise ValueError(
+                "SPDETRHybridEncoder expects three S3-S5 levels at strides 8/16/32"
+            )
+        self.hidden_dim = hidden_dim
+        self.out_channels = (hidden_dim, hidden_dim, hidden_dim)
+        self.out_strides = self.feat_strides
+
+        self.scaa_blocks = nn.ModuleList(
+            [ReconstructedSCAA(channel) for channel in self.in_channels]
+        )
+        self.input_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(channel, hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(hidden_dim),
+                )
+                for channel in self.in_channels
+            ]
+        )
+        self.aifi_layers = nn.ModuleList(
+            [
+                AIFIHiLo(
+                    hidden_dim,
+                    dim_feedforward=dim_feedforward,
+                    num_heads=nhead,
+                    dropout=0.0,
+                    window_size=2,
+                    alpha=0.5,
+                )
+                for _ in range(num_encoder_layers)
+            ]
+        )
+
+        blocks = max(1, round(3 * depth_mult))
+        self.lateral_convs = nn.ModuleList(
+            [
+                ConvNormLayer(hidden_dim, hidden_dim, 1, 1, activation="silu")
+                for _ in range(2)
+            ]
+        )
+        self.fpn_blocks = nn.ModuleList(
+            [
+                CSPRepLayer(
+                    hidden_dim * 2,
+                    hidden_dim,
+                    blocks,
+                    expansion,
+                    activation="silu",
+                )
+                for _ in range(2)
+            ]
+        )
+        self.downsample_convs = nn.ModuleList(
+            [
+                ConvNormLayer(hidden_dim, hidden_dim, 3, 2, activation="silu")
+                for _ in range(2)
+            ]
+        )
+        self.pan_blocks = nn.ModuleList(
+            [
+                CSPRepLayer(
+                    hidden_dim * 2,
+                    hidden_dim,
+                    blocks,
+                    expansion,
+                    activation="silu",
+                )
+                for _ in range(2)
+            ]
+        )
+
+    def forward(self, features: Sequence[Tensor]) -> Tuple[Tensor, ...]:
+        if len(features) != 3:
+            raise ValueError(f"Expected 3 FasterNet features, got {len(features)}")
+        attended_features = [
+            attention(feature)
+            for attention, feature in zip(self.scaa_blocks, features)
+        ]
+        projected = [
+            projection(feature)
+            for projection, feature in zip(self.input_projections, attended_features)
+        ]
+
+        # HiLo-AIFI remains confined to the deepest S5/P5 feature, following
+        # RT-DETR's efficient intra-scale interaction strategy.
+        for layer in self.aifi_layers:
+            projected[-1] = layer(projected[-1])
+
+        # Standard RT-DETR top-down FPN.
+        inner_outputs = [projected[-1]]
+        for feature_index in range(2, 0, -1):
+            module_index = 2 - feature_index
+            high = self.lateral_convs[module_index](inner_outputs[0])
+            inner_outputs[0] = high
+            upsampled = F.interpolate(high, scale_factor=2.0, mode="nearest")
+            low = projected[feature_index - 1]
+            fused = self.fpn_blocks[module_index](
+                torch.cat((upsampled, low), dim=1)
+            )
+            inner_outputs.insert(0, fused)
+
+        # Standard RT-DETR bottom-up PAN.
+        outputs = [inner_outputs[0]]
+        for feature_index in range(2):
+            downsampled = self.downsample_convs[feature_index](outputs[-1])
+            outputs.append(
+                self.pan_blocks[feature_index](
+                    torch.cat((downsampled, inner_outputs[feature_index + 1]), dim=1)
+                )
+            )
+        return tuple(outputs)
 
 
 class HybridEncoder(nn.Module):
@@ -1518,12 +2059,19 @@ class RTDETR(nn.Module):
         use_p2: bool = False,
         use_spd: bool = False,
         use_s2_fusion: bool = False,
+        use_spd_detr: bool = False,
     ) -> None:
         super().__init__()
         if use_s2_fusion and (use_p2 or use_spd):
             raise ValueError(
                 "use_s2_fusion is a separate SO-DETR-style experiment and "
                 "cannot be combined with use_p2 or use_spd."
+            )
+        if use_spd_detr and (use_p2 or use_spd or use_s2_fusion):
+            raise ValueError(
+                "use_spd_detr is a standalone paper-guided SPD-DETR "
+                "reconstruction and cannot be combined with use_p2, use_spd, "
+                "or use_s2_fusion."
             )
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -1534,27 +2082,37 @@ class RTDETR(nn.Module):
         self.use_p2 = use_p2
         self.use_spd = use_spd
         self.use_s2_fusion = use_s2_fusion
-        self.backbone = PResNet18(
-            input_channels,
-            use_p2=use_p2,
-            use_spd=use_spd,
-            use_s2_fusion=use_s2_fusion,
-        )
-        if use_s2_fusion:
-            self.encoder: nn.Module = S2FusionHybridEncoder(
+        self.use_spd_detr = use_spd_detr
+        if use_spd_detr:
+            self.backbone: nn.Module = SPDFasterNetT0(input_channels=input_channels)
+            self.encoder: nn.Module = SPDETRHybridEncoder(
                 in_channels=self.backbone.out_channels,
                 feat_strides=self.backbone.out_strides,
                 hidden_dim=hidden_dim,
                 expansion=0.5,
             )
         else:
-            self.encoder = HybridEncoder(
-                in_channels=self.backbone.out_channels,
-                feat_strides=self.backbone.out_strides,
-                hidden_dim=hidden_dim,
-                expansion=0.5,
+            self.backbone = PResNet18(
+                input_channels,
+                use_p2=use_p2,
                 use_spd=use_spd,
+                use_s2_fusion=use_s2_fusion,
             )
+            if use_s2_fusion:
+                self.encoder = S2FusionHybridEncoder(
+                    in_channels=self.backbone.out_channels,
+                    feat_strides=self.backbone.out_strides,
+                    hidden_dim=hidden_dim,
+                    expansion=0.5,
+                )
+            else:
+                self.encoder = HybridEncoder(
+                    in_channels=self.backbone.out_channels,
+                    feat_strides=self.backbone.out_strides,
+                    hidden_dim=hidden_dim,
+                    expansion=0.5,
+                    use_spd=use_spd,
+                )
         self.decoder = RTDETRTransformer(
             num_classes=num_classes,
             hidden_dim=hidden_dim,

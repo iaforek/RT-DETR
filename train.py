@@ -615,6 +615,7 @@ class ExperimentConfig:
     use_p2: bool
     use_spd: bool
     use_s2_fusion: bool
+    use_spd_detr: bool
     seed: int
     pretrained: str
 
@@ -713,6 +714,16 @@ def load_pretrained_weights(
                     f"model use_s2_fusion={target_use_s2_fusion}. "
                     "Use a checkpoint trained with the same S2-fusion layout, "
                     "or omit --pretrained for a controlled from-scratch S2-fusion experiment."
+                )
+            source_use_spd_detr = bool(source_config.get("use_spd_detr", False))
+            target_use_spd_detr = bool(getattr(model, "use_spd_detr", False))
+            if source_use_spd_detr != target_use_spd_detr:
+                raise ValueError(
+                    "Pretrained checkpoint architecture mismatch: "
+                    f"checkpoint use_spd_detr={source_use_spd_detr}, "
+                    f"model use_spd_detr={target_use_spd_detr}. "
+                    "Use a checkpoint trained with the same SPD-DETR reconstruction, "
+                    "or omit --pretrained for a controlled from-scratch experiment."
                 )
     else:
         state_dict = checkpoint
@@ -823,6 +834,7 @@ def train(args: argparse.Namespace) -> None:
         use_p2=args.use_p2,
         use_spd=args.use_spd,
         use_s2_fusion=args.use_s2_fusion,
+        use_spd_detr=args.use_spd_detr,
     )
 
     if args.pretrained:
@@ -843,6 +855,9 @@ def train(args: argparse.Namespace) -> None:
     print(f"P2 feature level: {'enabled' if args.use_p2 else 'disabled'}")
     print(f"SPD-Conv downsampling: {'enabled' if args.use_spd else 'disabled'}")
     print(f"SO-DETR-style S2 fusion: {'enabled' if args.use_s2_fusion else 'disabled'}")
+    print(f"SPD-DETR reconstruction: {'enabled' if args.use_spd_detr else 'disabled'}")
+    print(f"Backbone: {model.backbone.__class__.__name__}")
+    print(f"Encoder: {model.encoder.__class__.__name__}")
     print(f"Encoder output strides: {model.encoder.out_strides}")
 
     matcher = HungarianMatcher(cost_class=2.0, cost_bbox=5.0, cost_giou=2.0)
@@ -885,6 +900,7 @@ def train(args: argparse.Namespace) -> None:
         use_p2=args.use_p2,
         use_spd=args.use_spd,
         use_s2_fusion=args.use_s2_fusion,
+        use_spd_detr=args.use_spd_detr,
         seed=args.seed,
         pretrained=args.pretrained,
     )
@@ -1021,6 +1037,16 @@ def parse_args() -> argparse.Namespace:
             "remains P3-P5 (three levels)."
         ),
     )
+    parser.add_argument(
+        "--use-spd-detr",
+        action="store_true",
+        help=(
+            "Enable a paper-guided SPD-DETR reconstruction for comparison: "
+            "SPD-FasterNet-T0-style backbone, reconstructed parallel SCAA, "
+            "and HiLo-based AIFI with the standard RT-DETR P3-P5 CCFF/decoder. "
+            "This is not claimed to be the unavailable official author code."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument(
         "--backbone-learning-rate",
@@ -1064,6 +1090,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--use-s2-fusion is a separate SO-DETR-style experiment; "
             "do not combine it with --use-p2 or --use-spd"
+        )
+    if args.use_spd_detr and (args.use_p2 or args.use_spd or args.use_s2_fusion):
+        parser.error(
+            "--use-spd-detr is a standalone SPD-DETR reconstruction; do not "
+            "combine it with --use-p2, --use-spd, or --use-s2-fusion"
         )
     return args
 
