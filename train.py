@@ -23,6 +23,7 @@ import json
 import math
 import os
 import random
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,6 +39,9 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 
 from model import RTDETR, box_cxcywh_to_xyxy
+from checkpoint_selection import (
+    AP_EVALUATION, CHECKPOINT_METRIC, is_ap_improvement, restore_ap_selection,
+)
 
 
 ROOT = "/mnt/scratch2/users/40464858/VOC_dataset/voc_yolo"
@@ -587,6 +591,40 @@ def run_validation_epoch(
     return averages.averages()
 
 
+@torch.no_grad()
+def run_ap_validation(
+    model: RTDETR,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+) -> Dict[str, float]:
+    # Import lazily: validate.py also imports training's dataset helpers.
+    # Use its inference path (eval mode, no denoising) and exact AP implementation.
+    from validate import collect_predictions, evaluate_metrics
+
+    predictions, ground_truth, _, _ = collect_predictions(
+        model, loader, device, model.num_classes,
+        AP_EVALUATION["ap_conf_thres"], AP_EVALUATION["max_detections"],
+        amp_enabled, log_interval=0,
+    )
+    results = evaluate_metrics(
+        predictions, ground_truth,
+        [f"class_{index}" for index in range(model.num_classes)],
+        fixed_confidence_threshold=0.25,
+        fixed_iou_threshold=0.50,
+        ap_confidence_threshold=AP_EVALUATION["ap_conf_thres"],
+    )
+    ap = results["summary"]["ap"]
+    score = float(ap["map50_95"])
+    if not math.isfinite(score):
+        raise ValueError(
+            "Validation AP is undefined. Check that the validation split has "
+            "ground-truth labels; refusing to select a best checkpoint."
+        )
+    is_ap_improvement(score, None)
+    return {"map50": float(ap["map50"]), "map50_95": score}
+
+
 def format_epoch_metrics(prefix: str, metrics: Mapping[str, float]) -> str:
     return (
         f"{prefix}: loss={metrics.get('loss', math.nan):.4f}, "
@@ -618,6 +656,7 @@ class ExperimentConfig:
     use_spd_detr: bool
     seed: int
     pretrained: str
+    checkpoint_metric: str = CHECKPOINT_METRIC
 
 
 def save_checkpoint(
@@ -631,6 +670,8 @@ def save_checkpoint(
     config: ExperimentConfig,
     train_metrics: Mapping[str, float],
     validation_metrics: Mapping[str, float],
+    best_validation_ap: float,
+    best_ap_epoch: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -642,6 +683,10 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "best_validation_loss": best_validation_loss,
+            "checkpoint_metric": CHECKPOINT_METRIC,
+            "ap_evaluation": dict(AP_EVALUATION),
+            "best_validation_ap": best_validation_ap,
+            "best_ap_epoch": best_ap_epoch,
             "config": asdict(config),
             "train_metrics": dict(train_metrics),
             "validation_metrics": dict(validation_metrics),
@@ -657,15 +702,19 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     device: torch.device,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, float | None, int | None]:
     checkpoint = torch.load(path, map_location=device)
+    best_ap, best_ap_epoch = restore_ap_selection(checkpoint)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     if "scaler" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler"])
-    return int(checkpoint["epoch"]) + 1, float(
-        checkpoint.get("best_validation_loss", math.inf)
+    return (
+        int(checkpoint["epoch"]) + 1,
+        float(checkpoint.get("best_validation_loss", math.inf)),
+        best_ap,
+        best_ap_epoch,
     )
 
 def load_pretrained_weights(
@@ -904,16 +953,15 @@ def train(args: argparse.Namespace) -> None:
         seed=args.seed,
         pretrained=args.pretrained,
     )
-    with (output_dir / "config.json").open("w", encoding="utf-8") as file:
-        json.dump(asdict(config), file, indent=2)
-
     start_epoch = 0
     best_validation_loss = math.inf
+    best_validation_ap = None
+    best_ap_epoch = None
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
-        start_epoch, best_validation_loss = load_checkpoint(
+        start_epoch, best_validation_loss, best_validation_ap, best_ap_epoch = load_checkpoint(
             resume_path,
             model,
             optimizer,
@@ -922,6 +970,39 @@ def train(args: argparse.Namespace) -> None:
             device,
         )
         print(f"Resumed from epoch {start_epoch}")
+
+        if best_validation_ap is None:
+            print(
+                "Legacy loss-selected checkpoint: evaluating resumed weights to "
+                "start AP selection. Earlier unsaved epochs cannot be ranked."
+            )
+            baseline_metrics = run_validation_epoch(
+                model, validation_loader, criterion, device, amp_enabled,
+            )
+            baseline_metrics.update(run_ap_validation(
+                model, validation_loader, device, amp_enabled,
+            ))
+            best_validation_ap = baseline_metrics[CHECKPOINT_METRIC]
+            best_ap_epoch = start_epoch - 1
+            best_path = output_dir / "best.pt"
+            if best_path.exists():
+                backup = output_dir / "best_before_ap_selection.pt"
+                suffix = 1
+                while backup.exists():
+                    backup = output_dir / f"best_before_ap_selection_{suffix}.pt"
+                    suffix += 1
+                shutil.copy2(best_path, backup)
+                print(f"Preserved previous best checkpoint: {backup}")
+            save_checkpoint(
+                best_path, model, optimizer, scheduler, scaler,
+                best_ap_epoch, best_validation_loss, config, {}, baseline_metrics,
+                best_validation_ap, best_ap_epoch,
+            )
+            print(f"Starting best validation mAP50:95: {best_validation_ap:.6f}")
+
+    with (output_dir / "config.json").open("w", encoding="utf-8") as file:
+        json.dump({**asdict(config), "ap_evaluation": dict(AP_EVALUATION)}, file, indent=2)
+    print("Best checkpoint criterion: validation mAP@0.50:0.95 (higher is better)")
 
     history_path = output_dir / "history.jsonl"
     for epoch in range(start_epoch, args.epochs):
@@ -946,16 +1027,26 @@ def train(args: argparse.Namespace) -> None:
             device,
             amp_enabled,
         )
+        validation_metrics.update(run_ap_validation(
+            model, validation_loader, device, amp_enabled,
+        ))
         scheduler.step()
         elapsed = time.perf_counter() - epoch_start
         print(format_epoch_metrics("Train", train_metrics))
         print(format_epoch_metrics("Val  ", validation_metrics))
+        print(
+            f"Val AP: mAP50={validation_metrics['map50']:.6f}, "
+            f"mAP50:95={validation_metrics['map50_95']:.6f}"
+        )
         print(f"Epoch time: {elapsed:.1f} seconds")
 
         validation_loss = validation_metrics["loss"]
-        improved = validation_loss < best_validation_loss
+        best_validation_loss = min(best_validation_loss, validation_loss)
+        validation_ap = validation_metrics[CHECKPOINT_METRIC]
+        improved = is_ap_improvement(validation_ap, best_validation_ap)
         if improved:
-            best_validation_loss = validation_loss
+            best_validation_ap = validation_ap
+            best_ap_epoch = epoch
         save_checkpoint(
             output_dir / "last.pt",
             model,
@@ -967,6 +1058,8 @@ def train(args: argparse.Namespace) -> None:
             config,
             train_metrics,
             validation_metrics,
+            best_validation_ap,
+            best_ap_epoch,
         )
         if improved:
             save_checkpoint(
@@ -980,8 +1073,10 @@ def train(args: argparse.Namespace) -> None:
                 config,
                 train_metrics,
                 validation_metrics,
+                best_validation_ap,
+                best_ap_epoch,
             )
-            print(f"Saved new best checkpoint: val loss {best_validation_loss:.4f}")
+            print(f"Saved new best checkpoint: validation mAP50:95 {best_validation_ap:.6f}")
         with history_path.open("a", encoding="utf-8") as file:
             file.write(
                 json.dumps(
@@ -992,6 +1087,10 @@ def train(args: argparse.Namespace) -> None:
                         "train": train_metrics,
                         "validation": validation_metrics,
                         "best_validation_loss": best_validation_loss,
+                        "checkpoint_metric": CHECKPOINT_METRIC,
+                        "ap_evaluation": dict(AP_EVALUATION),
+                        "best_validation_ap": best_validation_ap,
+                        "best_ap_epoch": best_ap_epoch + 1,
                     }
                 )
                 + "\n"

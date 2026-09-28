@@ -1,6 +1,6 @@
 # RT-DETR-R18 From Scratch
 
-Compact three-file RT-DETR-R18 recreation for direct comparison with the
+Compact RT-DETR-R18 recreation for direct comparison with the
 YOLOv3 and YOLOv26 learning repositories.
 
 ## Files
@@ -10,6 +10,7 @@ YOLOv3 and YOLOv26 learning repositories.
 - `train.py` — YOLO-format VOC dataset, Hungarian matching, Varifocal Loss,
   L1 box loss, GIoU loss, training/validation loops and checkpoints.
 - `validate.py` — full-dataset AP/mAP validation or single-image annotation.
+- `checkpoint_selection.py` — validation AP selection policy and resume checks.
 
 The architecture follows the original RT-DETR PyTorch implementation and its
 R18 configuration: PResNet-18 variant d, 256-dimensional hybrid encoder, 300
@@ -26,8 +27,9 @@ RT-DETR repository.
 pip install numpy pillow scipy
 ```
 
-Use the existing CUDA-enabled PyTorch installation in the `yolo_cuda`
-environment.
+Use an environment with PyTorch installed. GPU training requires a CUDA-enabled
+PyTorch installation; the local regression tests run on CPU. The local
+`diffraction-env` environment has successfully run all eight tests.
 
 ## Dataset layout
 
@@ -64,6 +66,7 @@ Resume:
 python train.py \
   --resume runs/rtdetr_voc/last.pt \
   --root /mnt/scratch2/users/40464858/VOC_dataset/voc_yolo \
+  --output-dir runs/rtdetr_voc \
   --epochs 100
 ```
 
@@ -76,6 +79,84 @@ runs/rtdetr_voc/
 ├── config.json
 └── history.jsonl
 ```
+
+`best.pt` is selected by **highest validation mAP@0.50:0.95**, measured after
+every epoch. Equal scores retain the earlier checkpoint. `last.pt` always stores
+the latest completed epoch for resuming. Validation loss remains a diagnostic;
+it does not select `best.pt`.
+
+AP uses the same inference and matching code as `validate.py`, with confidence
+cutoff 0.001 and at most 300 detections per image. This is the repository's custom
+AP protocol, not official COCOeval. The extra inference/AP pass increases epoch
+time. Use a fixed validation split for selection and a separate held-out test
+split for final reporting.
+
+History includes validation `map50`, `map50_95`, `best_validation_ap`, and
+`best_ap_epoch`. Checkpoints store the same selection state and evaluation
+protocol. Epoch fields in checkpoint files are zero-based; history epochs are
+one-based. Resume with the same dataset, architecture, image size and AMP setting.
+
+Older loss-selected checkpoints remain resumable. Their resumed weights are
+evaluated to establish an AP baseline before further training. Any existing
+`best.pt` in the output directory is preserved as `best_before_ap_selection.pt`
+(with a numbered suffix if needed). The AP baseline and subsequent epochs compete
+for the new `best.pt`; this cannot recover the best AP of discarded historical
+epochs, and the archived loss-best checkpoint is not automatically evaluated.
+For a new experiment, use a new output directory.
+
+## Run tests locally
+
+The tests use Python's built-in `unittest`; **pytest is not required**. Activate
+an environment containing PyTorch, NumPy, SciPy and Pillow. In a PowerShell
+terminal configured for Conda, run:
+
+```powershell
+conda activate diffraction-env
+cd C:\Users\40464858\Development\RT-DETR
+python -m unittest discover -s .\tests -v
+```
+
+Replace the environment name and repository path if your installation differs.
+Run discovery from the repository root so it finds this project's test files.
+
+To run each file separately:
+
+```powershell
+python -m unittest discover -s .\tests -p "test_checkpoint_selection.py" -v
+python -m unittest discover -s .\tests -p "test_training_ap.py" -v
+```
+
+The full suite currently contains eight tests. Successful output ends with:
+
+```text
+Ran 8 tests in ...
+
+OK
+```
+
+`test_checkpoint_selection.py` checks invalid AP rejection, zero initial scores,
+strict improvement, and restoration of the best AP and evaluation protocol.
+`test_training_ap.py` checks AP-based selection despite lower loss at another
+epoch, resume and tie handling, legacy checkpoint preservation, empty validation
+labels, and agreement between logged AP and a reloaded real-model checkpoint.
+
+The integration tests run on CPU and create temporary images and checkpoints,
+which are cleaned up automatically. They do not require your research datasets
+or modify existing experiment results. Passing them verifies these code paths;
+it does not establish full-dataset accuracy or GPU stability.
+
+### Troubleshooting
+
+- If a traceback points to `site-packages\tests\test_cli.py` and complains about
+  missing `pytest`, an unrelated installed test package was discovered. Use the
+  repository-root discovery commands above rather than an import such as
+  `python -m unittest tests.test_training_ap`. Installing pytest is not needed
+  for this project's tests.
+- Some PyTorch versions emit a `FutureWarning` from `torch.load()` because the
+  resume loader does not explicitly specify `weights_only`. This warning does
+  not fail the tests; the test checkpoints are generated within the tests.
+  Check that the final result is `OK`. Outside the tests, only load checkpoints
+  from trusted sources.
 
 ## Validate the complete VOC split
 
