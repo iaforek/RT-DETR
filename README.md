@@ -199,6 +199,15 @@ python validate.py \
 RT-DETR uses its native NMS-free decoder-query output. No NMS parameter is
 required.
 
+## Compressed-byte sprite experiment
+
+An independent synthetic experiment compares a pixel CNN against networks trained
+directly on complete PNG/GIF bytes. It generates 64×64 indexed-colour sprites,
+object masks, recolouring diffs and bounding-box labels, with separate train,
+validation and test scenes. See [the experiment guide](experiments/compressed_sprites/README.md)
+for generation, training, controls and local test commands. This does not change
+the RT-DETR pipeline.
+
 ## Official basis
 
 - Paper: *DETRs Beat YOLOs on Real-time Object Detection*, CVPR 2024
