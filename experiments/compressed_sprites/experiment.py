@@ -1,4 +1,4 @@
-"""Controlled single-object detection from pixels or complete encoded file bytes."""
+"""Controlled detection from pixels, raw indices or complete encoded file bytes."""
 import argparse
 import copy
 import json
@@ -14,6 +14,16 @@ def indexed(array, palette):
     image = Image.fromarray(array).convert("P")
     image.putpalette(palette.reshape(-1).tolist())
     return image
+
+
+def read_sequence(path, mode, limit):
+    """Return source bytes without decoding; raw indices must describe a 64x64 scene."""
+    raw = path.read_bytes()
+    if mode == "raw_bytes" and len(raw) != 64 * 64:
+        raise ValueError(f"{path}: raw indices must contain exactly 4096 bytes, got {len(raw)}")
+    if len(raw) > limit:
+        raise ValueError(f"{path}: {len(raw)} bytes exceeds --max-bytes {limit}; no truncation allowed")
+    return raw
 
 
 def generate(args):
@@ -117,9 +127,7 @@ def train(args):
                 with Image.open(path) as im:
                     x = torch.from_numpy(np.array(im.convert("RGB"))).permute(2, 0, 1).float() / 255
             else:
-                raw = path.read_bytes()  # No image decoding or header stripping.
-                if len(raw) > self.limit:
-                    raise ValueError(f"{path}: {len(raw)} bytes exceeds --max-bytes {self.limit}; no truncation allowed")
+                raw = read_sequence(path, self.mode, self.limit)
                 x = torch.full((self.limit,), 256, dtype=torch.long)
                 x[:len(raw)] = torch.tensor(list(raw), dtype=torch.long)
             return x, torch.tensor(record["class"]), torch.tensor(record["box"], dtype=torch.float32)
@@ -197,7 +205,7 @@ def train(args):
 
     for mode in args.modes:
         torch.manual_seed(args.seed)
-        variant = "image.gif" if mode == "gif_bytes" else "image.png"
+        variant = {"raw_bytes": "indices.bin", "gif_bytes": "image.gif"}.get(mode, "image.png")
         def loader(split, name=variant, shuffle=False):
             return DataLoader(Scenes(split, mode, name, args.max_bytes), batch_size=args.batch_size,
                               shuffle=shuffle, num_workers=0)
@@ -240,7 +248,7 @@ def train(args):
         torch.save({"model": best_state, "mode": mode, "args": vars(args),
                     "best_epoch": best_epoch}, out / f"{mode}.pt")
         tests = {}
-        for name in (["image.gif"] if mode == "gif_bytes" else variants):
+        for name in ([variant] if mode in ("raw_bytes", "gif_bytes") else variants):
             # Warm-up outside reported timing; test labels never select weights.
             with torch.inference_mode():
                 model(next(iter(loader("test", name)))[0].to(device))
@@ -268,7 +276,8 @@ def main():
     run = sub.add_parser("train")
     run.add_argument("--data", default="experiments/compressed_sprites/data")
     run.add_argument("--output", default="experiments/compressed_sprites/runs/seed42")
-    run.add_argument("--modes", nargs="+", choices=["pixels", "png_bytes", "gif_bytes"], default=["pixels", "png_bytes", "gif_bytes"])
+    run.add_argument("--modes", nargs="+", choices=["pixels", "raw_bytes", "png_bytes", "gif_bytes"],
+                     default=["pixels", "raw_bytes", "png_bytes", "gif_bytes"])
     run.add_argument("--epochs", type=int, default=30)
     run.add_argument("--batch-size", type=int, default=32)
     run.add_argument("--max-bytes", type=int, default=8192)

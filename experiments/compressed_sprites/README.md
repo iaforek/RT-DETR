@@ -25,7 +25,30 @@ directories are refused to prevent accidental overwriting. For additional seeds:
 python experiments/compressed_sprites/experiment.py train --seed 43 --device cuda --output experiments/compressed_sprites/runs/seed43
 ```
 
-To run just one model, append `--modes png_bytes` (or `pixels`, `gif_bytes`).
+To run just one model, append `--modes raw_bytes` (or `pixels`, `png_bytes`, `gif_bytes`).
+The default now includes all four modes. Existing generated datasets already contain
+`indices.bin`; no regeneration is needed for the new raw-index control.
+
+For the three-way, 100-epoch comparison on Kelvin2, run from the repository root
+in your existing PyTorch environment (inside your usual allocated GPU job):
+
+```bash
+python experiments/compressed_sprites/experiment.py train \
+  --device cuda --modes pixels raw_bytes png_bytes --epochs 100 \
+  --output experiments/compressed_sprites/runs/seed42_raw_comparison
+```
+
+To train only the added model on the same dataset:
+
+```bash
+python experiments/compressed_sprites/experiment.py train \
+  --device cuda --modes raw_bytes --epochs 100 \
+  --output experiments/compressed_sprites/runs/seed42_raw_only
+```
+
+Both commands start fresh training and keep earlier results intact. The raw model
+saves `raw_bytes.pt` and a `raw_bytes` entry in `results.json`, whose test metrics
+are under `test.indices.bin`.
 To make a small smoke dataset, use a new `--data` directory and
 `--train 24 --val 8 --test 8`; train it with `--epochs 1` and a new `--output`.
 A smoke run checks execution only; it does not establish learning or generalisation.
@@ -69,6 +92,13 @@ remain in its original split. Colours do not encode the object class.
 ## Models and controls
 
 - `pixels`: conventional 2D CNN operating on decoded RGB float32 tensors.
+- `raw_bytes`: 4,096 uncompressed palette indices from `indices.bin`, flattened
+  row by row. Position `i` corresponds to `x = i % 64`, `y = i // 64`.
+  Uses exactly the same embedding, 1D CNN, pooling and prediction head as PNG/GIF,
+  with the same padding length, optimiser, losses and checkpoint selection.
+  It adds no coordinate inputs and never reads masks or labels as features.
+  The palette is fixed across the dataset, so it is not included in this input.
+  Requires exactly 4,096 source bytes; malformed files are rejected.
 - `png_bytes`: byte embeddings and a 1D CNN over the **entire PNG file**, including
   headers, palette and compressed payload. No PNG decoding is performed by this
   input path. Positional bins are retained before the prediction head.
@@ -80,7 +110,18 @@ Excessively long files cause an explicit error; increase `--max-bytes` if needed
 Padding and embeddings can consume MORE memory than decoded pixels. A smaller
 file is not automatically a smaller neural-network input or cheaper computation.
 The architecture is intentionally a baseline; unsuccessful learning would not
-prove that no byte-based architecture can work. Parameters/compute are not matched.
+prove that no byte-based architecture can work. Pixel versus byte models are not
+parameter/compute matched. Raw, PNG and GIF share the same architecture (155,120
+parameters), padded tensor shape and seed-reset initialization. Their amount of
+padding and distribution of informative tokens still differ. GPU training is not
+guaranteed deterministic merely by setting the seed.
+
+The raw control tests whether this 1D network can learn image coordinates without
+also interpreting compression. Strong raw localisation and weak PNG localisation
+would implicate the compressed representation/format processing; weak performance
+on both would motivate investigation of the sequence architecture and optimisation.
+It does not isolate DEFLATE alone: PNG also contains headers, palette and filters.
+Raw evaluation uses the original `indices.bin` only, not shuffled-palette variants.
 
 Training uses class cross-entropy and positive-only L1/IoU box losses. Checkpoints
 are selected only on validation data by correct-class recall at IoU >= .5 plus

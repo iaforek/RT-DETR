@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from experiment import generate
+from experiment import generate, read_sequence
 
 
 class DatasetIntegrityTests(unittest.TestCase):
@@ -61,6 +61,24 @@ class DatasetIntegrityTests(unittest.TestCase):
             folder = self.root / record["path"]
             self.assertNotEqual((folder / "image.png").read_bytes(),
                                 (folder / "image_level0.png").read_bytes())
+
+    def test_raw_sequence_matches_pixel_positions(self):
+        for record in self.records:
+            folder = self.root / record["path"]
+            sequence = read_sequence(folder / "indices.bin", "raw_bytes", 8192)
+            with Image.open(folder / "image.png") as image:
+                expected = np.array(image).reshape(-1).tobytes()
+            self.assertEqual(sequence, expected)
+            self.assertEqual(len(sequence), 4096)
+
+    def test_raw_sequence_rejects_bad_size_and_truncation(self):
+        folder = self.root / self.records[0]["path"]
+        with self.assertRaisesRegex(ValueError, "exactly 4096"):
+            read_sequence(folder / "image.png", "raw_bytes", 8192)
+        with self.assertRaisesRegex(ValueError, "no truncation"):
+            read_sequence(folder / "indices.bin", "raw_bytes", 4095)
+        self.assertEqual(read_sequence(folder / "image.png", "png_bytes", 8192),
+                         (folder / "image.png").read_bytes())
 
 
 if __name__ == "__main__":
