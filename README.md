@@ -214,3 +214,64 @@ the RT-DETR pipeline.
 - Code: `https://github.com/lyuwenyu/RT-DETR`
 - R18 configuration:
   `rtdetr_pytorch/configs/rtdetr/rtdetr_r18vd_6x_coco.yml`
+
+## Selectable SpatialUNet encoder backbone
+
+`--backbone presnet18` is the default and preserves existing experiments.
+`--backbone spatial_unet` selects `SpatialUNetBackbone` from
+`spatial_unet_model.py`. Both start from random initialisation unless a
+compatible RT-DETR checkpoint is explicitly loaded.
+
+This adaptation retains the supplied SpatialUNet encoder's double 3x3
+convolutions, GroupNorm(8), GELU and widths 16/32/64/128/256. It adds a
+512-channel stage at stride 32. The reconstruction decoder, sigmoid head
+and pooled latent projection are not part of the detection backbone.
+The RT-DETR hybrid encoder and detection decoder remain in use.
+
+| Output | Source | Channels | Stride |
+|---|---|---:|---:|
+| S2 (optional) | encoder3 | 64 | 4 |
+| S3 | encoder4 | 128 | 8 |
+| S4 | bottleneck | 256 | 16 |
+| S5 | added encoder5 | 512 | 32 |
+
+The detector continues to load RGB images; the first convolution accepts
+three channels. This patch does not import the grayscale OCT-F checkpoint
+or change OCT-F training code. Input height and width must be multiples of
+32, as already required by the training CLI. Base width is fixed at 16 in
+the RT-DETR integration to keep the CLI and checkpoint contract small.
+
+Examples (add your usual --root, --epochs and other training arguments):
+
+```bash
+python train.py --backbone spatial_unet --output-dir runs/spatial_unet
+python train.py --backbone spatial_unet --use-p2 --output-dir runs/spatial_unet_p2
+python train.py --backbone spatial_unet --use-p2 --use-spd --output-dir runs/spatial_unet_p2_spd
+python train.py --backbone spatial_unet --use-s2-fusion --output-dir runs/spatial_unet_s2
+```
+
+`--use-spd` also works without P2. It replaces all five backbone max-pool
+transitions with the existing SPDConv (space-to-depth, stride-1 convolution,
+BatchNorm and GELU). The double-convolution blocks retain GroupNorm. The
+existing SPD option also modifies bottom-up PAN downsampling. This makes
+SPD a combined backbone/PAN ablation, not a backbone-only change.
+
+P2 exposes S2 to a four-level encoder/decoder. S2 fusion instead injects S2
+into P3 and keeps a three-level decoder. As before, S2 fusion is mutually
+exclusive with P2 and global SPD; its own S2 fusion branch uses SPDConv.
+`--use-spd-detr` remains the standalone FasterNet reconstruction and cannot
+be combined with `--backbone spatial_unet`.
+
+The backbone choice is recorded in config.json and checkpoint config.
+Validation selects it automatically:
+
+```bash
+python validate.py --checkpoint runs/spatial_unet_p2/best.pt --root /path/to/data
+```
+
+For training resume, supply the same backbone and feature flags as the
+original run, alongside `--resume runs/spatial_unet_p2/last.pt`.
+Old checkpoints without a backbone field default to presnet18. Backbone
+mismatches are rejected for configured pretrained/resume checkpoints.
+`--pretrained` retains the existing same-layout RT-DETR weight loading
+semantics; it is not an OCT-F autoencoder weight importer.

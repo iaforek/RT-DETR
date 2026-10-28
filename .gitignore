@@ -4,3 +4,7 @@ runs
 *.out
 *.err
 *.sh
+patches
+predictions
+logs
+scripts

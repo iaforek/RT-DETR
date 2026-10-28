@@ -2060,6 +2060,7 @@ class RTDETR(nn.Module):
         use_spd: bool = False,
         use_s2_fusion: bool = False,
         use_spd_detr: bool = False,
+        backbone: str = "presnet18",
     ) -> None:
         super().__init__()
         if use_s2_fusion and (use_p2 or use_spd):
@@ -2073,6 +2074,11 @@ class RTDETR(nn.Module):
                 "reconstruction and cannot be combined with use_p2, use_spd, "
                 "or use_s2_fusion."
             )
+        if backbone not in ("presnet18", "spatial_unet"):
+            raise ValueError(f"Unknown backbone: {backbone}")
+        if use_spd_detr and backbone != "presnet18":
+            raise ValueError("SPD-DETR selects its own FasterNet backbone; omit --backbone")
+        self.backbone_name = backbone
         self.input_channels = input_channels
         self.num_classes = num_classes
         self.num_queries = num_queries
@@ -2092,12 +2098,19 @@ class RTDETR(nn.Module):
                 expansion=0.5,
             )
         else:
-            self.backbone = PResNet18(
-                input_channels,
-                use_p2=use_p2,
-                use_spd=use_spd,
-                use_s2_fusion=use_s2_fusion,
-            )
+            if backbone == "spatial_unet":
+                from spatial_unet_model import SpatialUNetBackbone
+                self.backbone = SpatialUNetBackbone(
+                    input_channels, use_p2=use_p2, use_spd=use_spd,
+                    use_s2_fusion=use_s2_fusion, spd_factory=SPDConv,
+                )
+            else:
+                self.backbone = PResNet18(
+                    input_channels,
+                    use_p2=use_p2,
+                    use_spd=use_spd,
+                    use_s2_fusion=use_s2_fusion,
+                )
             if use_s2_fusion:
                 self.encoder = S2FusionHybridEncoder(
                     in_channels=self.backbone.out_channels,

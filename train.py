@@ -656,6 +656,7 @@ class ExperimentConfig:
     use_spd_detr: bool
     seed: int
     pretrained: str
+    backbone: str = "presnet18"
     checkpoint_metric: str = CHECKPOINT_METRIC
 
 
@@ -705,6 +706,9 @@ def load_checkpoint(
 ) -> Tuple[int, float, float | None, int | None]:
     checkpoint = torch.load(path, map_location=device)
     best_ap, best_ap_epoch = restore_ap_selection(checkpoint)
+    source_backbone = checkpoint.get("config", {}).get("backbone", "presnet18")
+    if source_backbone != model.backbone_name:
+        raise ValueError(f"Resume backbone mismatch: {source_backbone} != {model.backbone_name}")
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -736,6 +740,11 @@ def load_pretrained_weights(
         state_dict = checkpoint["model"]
         source_config = checkpoint.get("config", {})
         if isinstance(source_config, Mapping):
+            source_backbone = source_config.get("backbone", "presnet18")
+            if source_backbone != model.backbone_name:
+                raise ValueError(
+                    f"Pretrained backbone mismatch: {source_backbone} != {model.backbone_name}"
+                )
             source_use_p2 = bool(source_config.get("use_p2", False))
             target_use_p2 = bool(getattr(model, "use_p2", False))
             if source_use_p2 != target_use_p2:
@@ -884,6 +893,7 @@ def train(args: argparse.Namespace) -> None:
         use_spd=args.use_spd,
         use_s2_fusion=args.use_s2_fusion,
         use_spd_detr=args.use_spd_detr,
+        backbone=args.backbone,
     )
 
     if args.pretrained:
@@ -950,6 +960,7 @@ def train(args: argparse.Namespace) -> None:
         use_spd=args.use_spd,
         use_s2_fusion=args.use_s2_fusion,
         use_spd_detr=args.use_spd_detr,
+        backbone=args.backbone,
         seed=args.seed,
         pretrained=args.pretrained,
     )
@@ -1101,6 +1112,8 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train RT-DETR-R18 from scratch")
+    parser.add_argument("--backbone", choices=("presnet18", "spatial_unet"),
+                        default="presnet18", help="Detection backbone (default: presnet18)")
     parser.add_argument("--root", default=ROOT)
     parser.add_argument("--img-size", type=int, default=DEFAULT_IMG_SIZE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -1173,6 +1186,8 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    if args.use_spd_detr and args.backbone != "presnet18":
+        parser.error("--use-spd-detr selects FasterNet and cannot use --backbone spatial_unet")
     if args.img_size % 32 != 0:
         parser.error("--img-size must be divisible by 32")
     if args.batch_size <= 0 or args.epochs <= 0:

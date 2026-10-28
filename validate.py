@@ -160,6 +160,7 @@ def build_model_from_checkpoint(
         use_spd=bool(config.get("use_spd", False)),
         use_s2_fusion=bool(config.get("use_s2_fusion", False)),
         use_spd_detr=bool(config.get("use_spd_detr", False)),
+        backbone=str(config.get("backbone", "presnet18")),
     ).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     if not isinstance(state_dict, Mapping):
@@ -176,6 +177,7 @@ def build_model_from_checkpoint(
         "use_spd": bool(config.get("use_spd", False)),
         "use_s2_fusion": bool(config.get("use_s2_fusion", False)),
         "use_spd_detr": bool(config.get("use_spd_detr", False)),
+        "backbone": str(config.get("backbone", "presnet18")),
     }
     return model, resolved
 
@@ -1533,7 +1535,7 @@ def validate_dataset(args: argparse.Namespace) -> None:
     print(
         "Model: SPD-DETR reconstruction"
         if config.get("use_spd_detr", False)
-        else "Model: RT-DETR-R18"
+        else f"Model: RT-DETR ({config['backbone']})"
     )
     print(f"Object queries: {config['num_queries']}")
     print(f"Decoder layers: {config['decoder_layers']}")
@@ -1610,8 +1612,9 @@ def validate_dataset(args: argparse.Namespace) -> None:
             "model": (
                 "SPD-DETR reconstruction"
                 if config.get("use_spd_detr", False)
-                else "RT-DETR-R18"
+                else f"RT-DETR ({config['backbone']})"
             ),
+            "backbone": config["backbone"],
             "num_queries": config["num_queries"],
             "decoder_layers": config["decoder_layers"],
             "use_p2": bool(config.get("use_p2", False)),
