@@ -232,8 +232,8 @@ The RT-DETR hybrid encoder and detection decoder remain in use.
 |---|---|---:|---:|
 | S2 (optional) | encoder3 | 64 | 4 |
 | S3 | encoder4 | 128 | 8 |
-| S4 | bottleneck | 256 | 16 |
-| S5 | added encoder5 | 512 | 32 |
+| S4 | encoder5 | 256 | 16 |
+| S5 | added encoder6 | 512 | 32 |
 
 The detector continues to load RGB images; the first convolution accepts
 three channels. This patch does not import the grayscale OCT-F checkpoint

@@ -36,12 +36,12 @@ class SpatialUNetBackbone(nn.Module):
             raise ValueError('SPD mode requires an SPDConv factory')
         self.input_channels = input_channels
         b = base_channels
-        self.encoder1 = ConvBlock(input_channels, b)
-        self.encoder2 = ConvBlock(b, 2*b)
-        self.encoder3 = ConvBlock(2*b, 4*b)
-        self.encoder4 = ConvBlock(4*b, 8*b)
-        self.bottleneck = ConvBlock(8*b, 16*b)
-        self.encoder5 = ConvBlock(16*b, 32*b)
+        self.encoder1 = ConvBlock(input_channels, b) # 16
+        self.encoder2 = ConvBlock(b, 2*b)            # 32
+        self.encoder3 = ConvBlock(2*b, 4*b)          # 64
+        self.encoder4 = ConvBlock(4*b, 8*b)          # 128
+        self.encoder5 = ConvBlock(8*b, 16*b)         # 256
+        self.encoder6 = ConvBlock(16*b, 32*b)        # 512
         # Inject the existing RT-DETR SPDConv to avoid duplicate implementations
         # and a circular import. Each transition has independent parameters.
         self.downsamples = nn.ModuleList([
@@ -62,6 +62,6 @@ class SpatialUNetBackbone(nn.Module):
         x = self.encoder2(self.downsamples[0](x))
         s2 = self.encoder3(self.downsamples[1](x))
         s3 = self.encoder4(self.downsamples[2](s2))
-        s4 = self.bottleneck(self.downsamples[3](s3))
-        s5 = self.encoder5(self.downsamples[4](s4))
+        s4 = self.encoder5(self.downsamples[3](s3))
+        s5 = self.encoder6(self.downsamples[4](s4))
         return (s2, s3, s4, s5) if self.return_s2 else (s3, s4, s5)
