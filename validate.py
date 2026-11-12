@@ -1720,7 +1720,7 @@ def parse_args() -> argparse.Namespace:
             "a class to enter within-class analysis (default: 20)"
         ),
     )
-    parser.add_argument("--output-dir", default="runs/rtdetr_voc/validation")
+    parser.add_argument("--output-dir", default="runs/rtdetr_default/validation")
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
